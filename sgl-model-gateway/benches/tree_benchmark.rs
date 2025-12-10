@@ -9,7 +9,15 @@
 //!
 //! For quick validation (CI): cargo bench --bench tree_benchmark -- benchmark_summary --exact
 
-use std::{sync::Arc, thread};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::Instant,
+};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::{
@@ -53,6 +61,17 @@ const CONVERSATION_PREFIXES: [&str; 6] = [
     "### Instruction:\n",
 ];
 
+// Global results storage for summary
+lazy_static::lazy_static! {
+    static ref BENCHMARK_RESULTS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+}
+
+fn add_result(category: &str, result: String) {
+    let mut results = BENCHMARK_RESULTS.lock().unwrap();
+    let index = results.len();
+    results.insert(format!("{:03}_{}", index, category), result);
+}
+
 /// Generate random ASCII strings of given length
 fn random_ascii_string(len: usize) -> String {
     Alphanumeric.sample_string(&mut thread_rng(), len)
@@ -92,6 +111,7 @@ fn bench_insert_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("insert_throughput");
 
     for text_len in [10, 50, 100, 500].iter() {
+        let printed = Arc::new(AtomicBool::new(false));
         group.throughput(Throughput::Elements(1));
         group.bench_with_input(
             BenchmarkId::new("random_text", text_len),
@@ -100,17 +120,38 @@ fn bench_insert_throughput(c: &mut Criterion) {
                 let tree = Tree::new();
                 let strings: Vec<String> = (0..1000).map(|_| random_ascii_string(len)).collect();
                 let mut idx = 0;
+                let printed_clone = printed.clone();
 
-                b.iter(|| {
-                    let tenant = ENDPOINT_TENANTS[idx % ENDPOINT_TENANTS.len()];
-                    tree.insert(black_box(&strings[idx % strings.len()]), tenant);
-                    idx += 1;
+                b.iter_custom(|iters| {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        let tenant = ENDPOINT_TENANTS[idx % ENDPOINT_TENANTS.len()];
+                        tree.insert(black_box(&strings[idx % strings.len()]), tenant);
+                        idx += 1;
+                    }
+                    let duration = start.elapsed();
+
+                    if !printed_clone.load(Ordering::Relaxed) {
+                        let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                        let result = format!(
+                            "{:<25} | {:>8} | {:>12.0} | {:>10}",
+                            format!("random_text_{}", len),
+                            len,
+                            ops_per_sec,
+                            10
+                        );
+                        add_result("insert", result);
+                        printed_clone.store(true, Ordering::Relaxed);
+                    }
+
+                    duration
                 });
             },
         );
     }
 
     // Benchmark with shared prefixes (common cache scenario) - distributed across endpoints
+    let printed_prefix = Arc::new(AtomicBool::new(false));
     group.bench_function("shared_prefix_100", |b| {
         let tree = Tree::new();
         let prefixes = ["system:", "user:", "assistant:", "tool:"];
@@ -119,24 +160,65 @@ fn bench_insert_throughput(c: &mut Criterion) {
             .flat_map(|p| random_prefixed_strings(p, 50, 250))
             .collect();
         let mut idx = 0;
+        let printed = printed_prefix.clone();
 
-        b.iter(|| {
-            let tenant = ENDPOINT_TENANTS[idx % ENDPOINT_TENANTS.len()];
-            tree.insert(black_box(&strings[idx % strings.len()]), tenant);
-            idx += 1;
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let tenant = ENDPOINT_TENANTS[idx % ENDPOINT_TENANTS.len()];
+                tree.insert(black_box(&strings[idx % strings.len()]), tenant);
+                idx += 1;
+            }
+            let duration = start.elapsed();
+
+            if !printed.load(Ordering::Relaxed) {
+                let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                let result = format!(
+                    "{:<25} | {:>8} | {:>12.0} | {:>10}",
+                    "shared_prefix",
+                    "~58",
+                    ops_per_sec,
+                    10
+                );
+                add_result("insert", result);
+                printed.store(true, Ordering::Relaxed);
+            }
+
+            duration
         });
     });
 
     // Benchmark with realistic LLM request patterns
+    let printed_llm = Arc::new(AtomicBool::new(false));
     group.bench_function("realistic_llm_requests", |b| {
         let tree = Tree::new();
         let requests = generate_realistic_requests(2000);
         let mut idx = 0;
+        let printed = printed_llm.clone();
 
-        b.iter(|| {
-            let tenant = ENDPOINT_TENANTS[idx % ENDPOINT_TENANTS.len()];
-            tree.insert(black_box(&requests[idx % requests.len()]), tenant);
-            idx += 1;
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let tenant = ENDPOINT_TENANTS[idx % ENDPOINT_TENANTS.len()];
+                tree.insert(black_box(&requests[idx % requests.len()]), tenant);
+                idx += 1;
+            }
+            let duration = start.elapsed();
+
+            if !printed.load(Ordering::Relaxed) {
+                let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                let result = format!(
+                    "{:<25} | {:>8} | {:>12.0} | {:>10}",
+                    "realistic_llm",
+                    "~100",
+                    ops_per_sec,
+                    10
+                );
+                add_result("insert", result);
+                printed.store(true, Ordering::Relaxed);
+            }
+
+            duration
         });
     });
 
@@ -148,7 +230,7 @@ fn bench_prefix_match_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("prefix_match_latency");
 
     // Setup: pre-populate tree with data distributed across all endpoints
-    let tree = Tree::new();
+    let tree = Arc::new(Tree::new());
     let prefixes = ["system:", "user:", "assistant:", "tool:"];
     let strings: Vec<String> = prefixes
         .iter()
@@ -162,38 +244,113 @@ fn bench_prefix_match_latency(c: &mut Criterion) {
     }
 
     // Benchmark cache hit (exact match)
+    let printed_hit = Arc::new(AtomicBool::new(false));
+    let tree_clone = tree.clone();
+    let strings_clone = strings.clone();
     group.bench_function("cache_hit", |b| {
         let mut idx = 0;
-        b.iter(|| {
-            let result = tree.prefix_match(black_box(&strings[idx % strings.len()]));
-            idx += 1;
-            result
+        let printed = printed_hit.clone();
+        let tree = tree_clone.clone();
+        let strings = strings_clone.clone();
+
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let result = tree.prefix_match(black_box(&strings[idx % strings.len()]));
+                black_box(result);
+                idx += 1;
+            }
+            let duration = start.elapsed();
+
+            if !printed.load(Ordering::Relaxed) {
+                let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                let latency_ns = duration.as_nanos() as f64 / iters as f64;
+                let result = format!(
+                    "{:<20} | {:>12.0} | {:>12.1}",
+                    "cache_hit",
+                    ops_per_sec,
+                    latency_ns
+                );
+                add_result("prefix_match", result);
+                printed.store(true, Ordering::Relaxed);
+            }
+
+            duration
         });
     });
 
     // Benchmark cache miss (no match)
     let miss_strings: Vec<String> = (0..1000).map(|_| random_ascii_string(50)).collect();
+    let printed_miss = Arc::new(AtomicBool::new(false));
+    let tree_clone = tree.clone();
     group.bench_function("cache_miss", |b| {
         let mut idx = 0;
-        b.iter(|| {
-            let result = tree.prefix_match(black_box(&miss_strings[idx % miss_strings.len()]));
-            idx += 1;
-            result
+        let printed = printed_miss.clone();
+        let tree = tree_clone.clone();
+        let miss_strings = miss_strings.clone();
+
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let result = tree.prefix_match(black_box(&miss_strings[idx % miss_strings.len()]));
+                black_box(result);
+                idx += 1;
+            }
+            let duration = start.elapsed();
+
+            if !printed.load(Ordering::Relaxed) {
+                let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                let latency_ns = duration.as_nanos() as f64 / iters as f64;
+                let result = format!(
+                    "{:<20} | {:>12.0} | {:>12.1}",
+                    "cache_miss",
+                    ops_per_sec,
+                    latency_ns
+                );
+                add_result("prefix_match", result);
+                printed.store(true, Ordering::Relaxed);
+            }
+
+            duration
         });
     });
 
     // Benchmark partial match
+    let printed_partial = Arc::new(AtomicBool::new(false));
+    let tree_clone = tree.clone();
     group.bench_function("partial_match", |b| {
         let partial_strings: Vec<String> = prefixes
             .iter()
             .map(|p| format!("{}partial_query", p))
             .collect();
         let mut idx = 0;
-        b.iter(|| {
-            let result =
-                tree.prefix_match(black_box(&partial_strings[idx % partial_strings.len()]));
-            idx += 1;
-            result
+        let printed = printed_partial.clone();
+        let tree = tree_clone.clone();
+
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let result =
+                    tree.prefix_match(black_box(&partial_strings[idx % partial_strings.len()]));
+                black_box(result);
+                idx += 1;
+            }
+            let duration = start.elapsed();
+
+            if !printed.load(Ordering::Relaxed) {
+                let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                let latency_ns = duration.as_nanos() as f64 / iters as f64;
+                let result = format!(
+                    "{:<20} | {:>12.0} | {:>12.1}",
+                    "partial_match",
+                    ops_per_sec,
+                    latency_ns
+                );
+                add_result("prefix_match", result);
+                printed.store(true, Ordering::Relaxed);
+            }
+
+            duration
         });
     });
 
@@ -207,68 +364,114 @@ fn bench_concurrent_operations(c: &mut Criterion) {
 
     // Mixed read/write workload with endpoint-style tenants
     for num_threads in [2, 4, 8, 16].iter() {
+        let printed = Arc::new(AtomicBool::new(false));
         group.bench_with_input(
             BenchmarkId::new("mixed_workload", num_threads),
             num_threads,
             |b, &threads| {
-                b.iter(|| {
-                    let tree = Arc::new(Tree::new());
-                    let handles: Vec<_> = (0..threads)
-                        .map(|t| {
-                            let tree = Arc::clone(&tree);
-                            thread::spawn(move || {
-                                // Each thread uses a different endpoint tenant
-                                let tenant = ENDPOINT_TENANTS[t % ENDPOINT_TENANTS.len()];
-                                for i in 0..200 {
-                                    let text = format!(
-                                        "{}thread{}_request{}",
-                                        CONVERSATION_PREFIXES[i % CONVERSATION_PREFIXES.len()],
-                                        t,
-                                        i
-                                    );
-                                    if i % 3 == 0 {
-                                        tree.prefix_match(&text);
-                                    } else {
-                                        tree.insert(&text, tenant);
-                                    }
-                                }
-                            })
-                        })
-                        .collect();
+                let printed_clone = printed.clone();
 
-                    for h in handles {
-                        h.join().unwrap();
+                b.iter_custom(|iters| {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        let tree = Arc::new(Tree::new());
+                        let handles: Vec<_> = (0..threads)
+                            .map(|t| {
+                                let tree = Arc::clone(&tree);
+                                thread::spawn(move || {
+                                    // Each thread uses a different endpoint tenant
+                                    let tenant = ENDPOINT_TENANTS[t % ENDPOINT_TENANTS.len()];
+                                    for i in 0..200 {
+                                        let text = format!(
+                                            "{}thread{}_request{}",
+                                            CONVERSATION_PREFIXES[i % CONVERSATION_PREFIXES.len()],
+                                            t,
+                                            i
+                                        );
+                                        if i % 3 == 0 {
+                                            tree.prefix_match(&text);
+                                        } else {
+                                            tree.insert(&text, tenant);
+                                        }
+                                    }
+                                })
+                            })
+                            .collect();
+
+                        for h in handles {
+                            h.join().unwrap();
+                        }
                     }
+                    let duration = start.elapsed();
+
+                    if !printed_clone.load(Ordering::Relaxed) {
+                        let total_ops = iters * threads as u64 * 200;
+                        let ops_per_sec = total_ops as f64 / duration.as_secs_f64();
+                        let result = format!(
+                            "{:<25} | {:>8} | {:>12.0} | {:>12.0}",
+                            format!("mixed_workload_{}_threads", threads),
+                            threads,
+                            ops_per_sec,
+                            ops_per_sec / threads as f64
+                        );
+                        add_result("concurrent", result);
+                        printed_clone.store(true, Ordering::Relaxed);
+                    }
+
+                    duration
                 });
             },
         );
     }
 
     // High-contention scenario: all threads sharing same prefixes
+    let printed_contention = Arc::new(AtomicBool::new(false));
     group.bench_function("high_contention_10_tenants", |b| {
-        b.iter(|| {
-            let tree = Arc::new(Tree::new());
-            let handles: Vec<_> = (0..10)
-                .map(|t| {
-                    let tree = Arc::clone(&tree);
-                    thread::spawn(move || {
-                        let tenant = ENDPOINT_TENANTS[t];
-                        // All threads insert similar prefixes to create contention
-                        for i in 0..100 {
-                            let text = format!(
-                                "<|system|>\nYou are a helpful assistant.\n<|user|>\nQuery {}",
-                                i
-                            );
-                            tree.insert(&text, tenant);
-                            tree.prefix_match(&text);
-                        }
-                    })
-                })
-                .collect();
+        let printed = printed_contention.clone();
 
-            for h in handles {
-                h.join().unwrap();
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let tree = Arc::new(Tree::new());
+                let handles: Vec<_> = (0..10)
+                    .map(|t| {
+                        let tree = Arc::clone(&tree);
+                        thread::spawn(move || {
+                            let tenant = ENDPOINT_TENANTS[t];
+                            // All threads insert similar prefixes to create contention
+                            for i in 0..100 {
+                                let text = format!(
+                                    "<|system|>\nYou are a helpful assistant.\n<|user|>\nQuery {}",
+                                    i
+                                );
+                                tree.insert(&text, tenant);
+                                tree.prefix_match(&text);
+                            }
+                        })
+                    })
+                    .collect();
+
+                for h in handles {
+                    h.join().unwrap();
+                }
             }
+            let duration = start.elapsed();
+
+            if !printed.load(Ordering::Relaxed) {
+                let total_ops = iters * 10 * 200; // 10 threads * 200 ops (100 inserts + 100 matches)
+                let ops_per_sec = total_ops as f64 / duration.as_secs_f64();
+                let result = format!(
+                    "{:<25} | {:>8} | {:>12.0} | {:>12.0}",
+                    "high_contention",
+                    10,
+                    ops_per_sec,
+                    ops_per_sec / 10.0
+                );
+                add_result("concurrent", result);
+                printed.store(true, Ordering::Relaxed);
+            }
+
+            duration
         });
     });
 
@@ -281,37 +484,60 @@ fn bench_eviction(c: &mut Criterion) {
     group.sample_size(20); // Eviction is expensive
 
     for tree_size in [1000, 5000, 10000].iter() {
+        let printed = Arc::new(AtomicBool::new(false));
         group.bench_with_input(
             BenchmarkId::new("evict_to_half_single_tenant", tree_size),
             tree_size,
             |b, &size| {
-                b.iter_with_setup(
-                    || {
+                let printed_clone = printed.clone();
+
+                b.iter_custom(|iters| {
+                    let mut total_duration = std::time::Duration::ZERO;
+                    for _ in 0..iters {
                         // Setup: create tree with many entries for single tenant
                         let tree = Tree::new();
                         let tenant = ENDPOINT_TENANTS[0];
                         for i in 0..size {
                             tree.insert(&format!("entry_{:05}", i), tenant);
                         }
-                        tree
-                    },
-                    |tree| {
-                        // Evict to half size
+
+                        let start = Instant::now();
                         tree.evict_tenant_by_size(size / 2);
-                    },
-                );
+                        total_duration += start.elapsed();
+                    }
+
+                    if !printed_clone.load(Ordering::Relaxed) {
+                        let ops_per_sec = iters as f64 / total_duration.as_secs_f64();
+                        let latency_ms = total_duration.as_millis() as f64 / iters as f64;
+                        let result = format!(
+                            "{:<25} | {:>8} | {:>12.0} | {:>12.2}",
+                            format!("single_tenant_{}", size),
+                            size,
+                            ops_per_sec,
+                            latency_ms
+                        );
+                        add_result("eviction", result);
+                        printed_clone.store(true, Ordering::Relaxed);
+                    }
+
+                    total_duration
+                });
             },
         );
     }
 
     // Multi-tenant eviction: 10 tenants with overlapping data
     for tree_size in [1000, 5000, 10000].iter() {
+        let printed = Arc::new(AtomicBool::new(false));
         group.bench_with_input(
             BenchmarkId::new("evict_multi_tenant_10", tree_size),
             tree_size,
             |b, &size| {
-                b.iter_with_setup(
-                    || {
+                let printed_clone = printed.clone();
+
+                b.iter_custom(|iters| {
+                    let mut total_duration = std::time::Duration::ZERO;
+                    for _ in 0..iters {
                         // Setup: create tree with entries distributed across 10 tenants
                         let tree = Tree::new();
                         for i in 0..size {
@@ -320,13 +546,28 @@ fn bench_eviction(c: &mut Criterion) {
                             let prefix = CONVERSATION_PREFIXES[i % CONVERSATION_PREFIXES.len()];
                             tree.insert(&format!("{}entry_{:05}", prefix, i), tenant);
                         }
-                        tree
-                    },
-                    |tree| {
-                        // Evict to target size per tenant
-                        tree.evict_tenant_by_size(size / 20); // Much smaller target to trigger more eviction
-                    },
-                );
+
+                        let start = Instant::now();
+                        tree.evict_tenant_by_size(size / 20);
+                        total_duration += start.elapsed();
+                    }
+
+                    if !printed_clone.load(Ordering::Relaxed) {
+                        let ops_per_sec = iters as f64 / total_duration.as_secs_f64();
+                        let latency_ms = total_duration.as_millis() as f64 / iters as f64;
+                        let result = format!(
+                            "{:<25} | {:>8} | {:>12.0} | {:>12.2}",
+                            format!("multi_tenant_{}", size),
+                            size,
+                            ops_per_sec,
+                            latency_ms
+                        );
+                        add_result("eviction", result);
+                        printed_clone.store(true, Ordering::Relaxed);
+                    }
+
+                    total_duration
+                });
             },
         );
     }
@@ -338,8 +579,8 @@ fn bench_eviction(c: &mut Criterion) {
 fn bench_utf8_vs_ascii(c: &mut Criterion) {
     let mut group = c.benchmark_group("encoding");
 
-    let tree_ascii = Tree::new();
-    let tree_utf8 = Tree::new();
+    let tree_ascii = Arc::new(Tree::new());
+    let tree_utf8 = Arc::new(Tree::new());
 
     // Pre-populate with data distributed across endpoints
     let ascii_strings: Vec<String> = (0..1000).map(|_| random_ascii_string(50)).collect();
@@ -354,22 +595,66 @@ fn bench_utf8_vs_ascii(c: &mut Criterion) {
         tree_utf8.insert(s, tenant);
     }
 
+    let printed_ascii = Arc::new(AtomicBool::new(false));
+    let tree_ascii_clone = tree_ascii.clone();
+    let ascii_strings_clone = ascii_strings.clone();
     group.bench_function("ascii_match", |b| {
         let mut idx = 0;
-        b.iter(|| {
-            let result =
-                tree_ascii.prefix_match(black_box(&ascii_strings[idx % ascii_strings.len()]));
-            idx += 1;
-            result
+        let printed = printed_ascii.clone();
+        let tree = tree_ascii_clone.clone();
+        let strings = ascii_strings_clone.clone();
+
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let result = tree.prefix_match(black_box(&strings[idx % strings.len()]));
+                black_box(result);
+                idx += 1;
+            }
+            let duration = start.elapsed();
+
+            if !printed.load(Ordering::Relaxed) {
+                let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                let result = format!(
+                    "{:<20} | {:>12.0} | {:>12}",
+                    "ASCII",
+                    ops_per_sec,
+                    "baseline"
+                );
+                add_result("encoding", result);
+                printed.store(true, Ordering::Relaxed);
+            }
+
+            duration
         });
     });
 
+    let printed_utf8 = Arc::new(AtomicBool::new(false));
+    let tree_utf8_clone = tree_utf8.clone();
+    let utf8_strings_clone = utf8_strings.clone();
     group.bench_function("utf8_match", |b| {
         let mut idx = 0;
-        b.iter(|| {
-            let result = tree_utf8.prefix_match(black_box(&utf8_strings[idx % utf8_strings.len()]));
-            idx += 1;
-            result
+        let printed = printed_utf8.clone();
+        let tree = tree_utf8_clone.clone();
+        let strings = utf8_strings_clone.clone();
+
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let result = tree.prefix_match(black_box(&strings[idx % strings.len()]));
+                black_box(result);
+                idx += 1;
+            }
+            let duration = start.elapsed();
+
+            if !printed.load(Ordering::Relaxed) {
+                let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                let result = format!("{:<20} | {:>12.0} | {:>12}", "UTF-8", ops_per_sec, "N/A");
+                add_result("encoding", result);
+                printed.store(true, Ordering::Relaxed);
+            }
+
+            duration
         });
     });
 
@@ -380,7 +665,7 @@ fn bench_utf8_vs_ascii(c: &mut Criterion) {
 fn bench_multi_tenant(c: &mut Criterion) {
     let mut group = c.benchmark_group("multi_tenant");
 
-    let tree = Tree::new();
+    let tree = Arc::new(Tree::new());
 
     // Setup: 10 endpoint tenants with overlapping data patterns
     let prefixes = ["prompt:", "completion:", "context:", "system:", "user:"];
@@ -393,39 +678,87 @@ fn bench_multi_tenant(c: &mut Criterion) {
         }
     }
 
+    let printed_shared = Arc::new(AtomicBool::new(false));
+    let tree_clone = tree.clone();
     group.bench_function("shared_prefix_lookup_10_tenants", |b| {
         let queries: Vec<String> = prefixes
             .iter()
             .flat_map(|p| (0..50).map(move |i| format!("{}data_{}", p, i)))
             .collect();
         let mut idx = 0;
+        let printed = printed_shared.clone();
+        let tree = tree_clone.clone();
 
-        b.iter(|| {
-            let result = tree.prefix_match(black_box(&queries[idx % queries.len()]));
-            idx += 1;
-            result
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let result = tree.prefix_match(black_box(&queries[idx % queries.len()]));
+                black_box(result);
+                idx += 1;
+            }
+            let duration = start.elapsed();
+
+            if !printed.load(Ordering::Relaxed) {
+                let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                let result = format!(
+                    "{:<30} | {:>10} | {:>12.0}",
+                    "shared_prefix_lookup",
+                    10,
+                    ops_per_sec
+                );
+                add_result("multi_tenant", result);
+                printed.store(true, Ordering::Relaxed);
+            }
+
+            duration
         });
     });
 
+    let printed_specific = Arc::new(AtomicBool::new(false));
+    let tree_clone = tree.clone();
     group.bench_function("tenant_specific_match_10_tenants", |b| {
         let queries: Vec<(String, &str)> = ENDPOINT_TENANTS
             .iter()
             .flat_map(|&t| (0..20).map(move |i| (format!("prompt:data_{}", i), t)))
             .collect();
         let mut idx = 0;
+        let printed = printed_specific.clone();
+        let tree = tree_clone.clone();
 
-        b.iter(|| {
-            let (query, tenant) = &queries[idx % queries.len()];
-            let result = tree.prefix_match_tenant(black_box(query), black_box(tenant));
-            idx += 1;
-            result
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let (query, tenant) = &queries[idx % queries.len()];
+                let result = tree.prefix_match_tenant(black_box(query), black_box(tenant));
+                black_box(result);
+                idx += 1;
+            }
+            let duration = start.elapsed();
+
+            if !printed.load(Ordering::Relaxed) {
+                let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                let result = format!(
+                    "{:<30} | {:>10} | {:>12.0}",
+                    "tenant_specific_match",
+                    10,
+                    ops_per_sec
+                );
+                add_result("multi_tenant", result);
+                printed.store(true, Ordering::Relaxed);
+            }
+
+            duration
         });
     });
 
     // Benchmark tenant removal (simulates worker going offline)
+    let printed_removal = Arc::new(AtomicBool::new(false));
     group.bench_function("tenant_removal", |b| {
-        b.iter_with_setup(
-            || {
+        let printed = printed_removal.clone();
+
+        b.iter_custom(|iters| {
+            let mut total_duration = std::time::Duration::ZERO;
+            for _ in 0..iters {
                 // Setup: create tree with all endpoints
                 let tree = Tree::new();
                 for tenant in &ENDPOINT_TENANTS {
@@ -435,13 +768,28 @@ fn bench_multi_tenant(c: &mut Criterion) {
                         }
                     }
                 }
-                tree
-            },
-            |tree| {
-                // Remove one tenant (simulates worker going offline)
+
+                let start = Instant::now();
                 tree.remove_tenant(ENDPOINT_TENANTS[0]);
-            },
-        );
+                total_duration += start.elapsed();
+            }
+
+            if !printed.load(Ordering::Relaxed) {
+                let ops_per_sec = iters as f64 / total_duration.as_secs_f64();
+                let latency_ms = total_duration.as_millis() as f64 / iters as f64;
+                let result = format!(
+                    "{:<30} | {:>10} | {:>12.0} | {:>10.2}ms",
+                    "tenant_removal",
+                    10,
+                    ops_per_sec,
+                    latency_ms
+                );
+                add_result("multi_tenant", result);
+                printed.store(true, Ordering::Relaxed);
+            }
+
+            total_duration
+        });
     });
 
     group.finish();
@@ -452,81 +800,233 @@ fn bench_summary(c: &mut Criterion) {
     let mut group = c.benchmark_group("benchmark_summary");
 
     // Representative insert benchmark
+    let printed_insert = Arc::new(AtomicBool::new(false));
     group.bench_function("insert_realistic", |b| {
         let tree = Tree::new();
         let requests = generate_realistic_requests(1000);
         let mut idx = 0;
+        let printed = printed_insert.clone();
 
-        b.iter(|| {
-            let tenant = ENDPOINT_TENANTS[idx % ENDPOINT_TENANTS.len()];
-            tree.insert(black_box(&requests[idx % requests.len()]), tenant);
-            idx += 1;
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let tenant = ENDPOINT_TENANTS[idx % ENDPOINT_TENANTS.len()];
+                tree.insert(black_box(&requests[idx % requests.len()]), tenant);
+                idx += 1;
+            }
+            let duration = start.elapsed();
+
+            if !printed.load(Ordering::Relaxed) {
+                let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                let result = format!(
+                    "{:<25} | {:>12.0} | {:>12}",
+                    "insert_realistic",
+                    ops_per_sec,
+                    "PASS"
+                );
+                add_result("summary", result);
+                printed.store(true, Ordering::Relaxed);
+            }
+
+            duration
         });
     });
 
     // Representative lookup benchmark
-    {
-        let tree = Tree::new();
-        let requests = generate_realistic_requests(1000);
-        for (i, req) in requests.iter().enumerate() {
-            let tenant = ENDPOINT_TENANTS[i % ENDPOINT_TENANTS.len()];
-            tree.insert(req, tenant);
-        }
-
-        group.bench_function("prefix_match_realistic", |b| {
-            let mut idx = 0;
-            b.iter(|| {
-                let result = tree.prefix_match(black_box(&requests[idx % requests.len()]));
-                idx += 1;
-                result
-            });
-        });
+    let tree = Arc::new(Tree::new());
+    let requests = generate_realistic_requests(1000);
+    for (i, req) in requests.iter().enumerate() {
+        let tenant = ENDPOINT_TENANTS[i % ENDPOINT_TENANTS.len()];
+        tree.insert(req, tenant);
     }
+
+    let printed_match = Arc::new(AtomicBool::new(false));
+    let tree_clone = tree.clone();
+    let requests_clone = requests.clone();
+    group.bench_function("prefix_match_realistic", |b| {
+        let mut idx = 0;
+        let printed = printed_match.clone();
+        let tree = tree_clone.clone();
+        let requests = requests_clone.clone();
+
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let result = tree.prefix_match(black_box(&requests[idx % requests.len()]));
+                black_box(result);
+                idx += 1;
+            }
+            let duration = start.elapsed();
+
+            if !printed.load(Ordering::Relaxed) {
+                let ops_per_sec = iters as f64 / duration.as_secs_f64();
+                let result = format!(
+                    "{:<25} | {:>12.0} | {:>12}",
+                    "prefix_match_realistic",
+                    ops_per_sec,
+                    "PASS"
+                );
+                add_result("summary", result);
+                printed.store(true, Ordering::Relaxed);
+            }
+
+            duration
+        });
+    });
 
     // Representative concurrent benchmark
     group.sample_size(30);
+    let printed_concurrent = Arc::new(AtomicBool::new(false));
     group.bench_function("concurrent_mixed_8_threads", |b| {
-        b.iter(|| {
-            let tree = Arc::new(Tree::new());
-            let handles: Vec<_> = (0..8)
-                .map(|t| {
-                    let tree = Arc::clone(&tree);
-                    thread::spawn(move || {
-                        let tenant = ENDPOINT_TENANTS[t % ENDPOINT_TENANTS.len()];
-                        for i in 0..100 {
-                            let text = format!(
-                                "{}thread{}_request{}",
-                                CONVERSATION_PREFIXES[i % CONVERSATION_PREFIXES.len()],
-                                t,
-                                i
-                            );
-                            if i % 3 == 0 {
-                                tree.prefix_match(&text);
-                            } else {
-                                tree.insert(&text, tenant);
-                            }
-                        }
-                    })
-                })
-                .collect();
+        let printed = printed_concurrent.clone();
 
-            for h in handles {
-                h.join().unwrap();
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let tree = Arc::new(Tree::new());
+                let handles: Vec<_> = (0..8)
+                    .map(|t| {
+                        let tree = Arc::clone(&tree);
+                        thread::spawn(move || {
+                            let tenant = ENDPOINT_TENANTS[t % ENDPOINT_TENANTS.len()];
+                            for i in 0..100 {
+                                let text = format!(
+                                    "{}thread{}_request{}",
+                                    CONVERSATION_PREFIXES[i % CONVERSATION_PREFIXES.len()],
+                                    t,
+                                    i
+                                );
+                                if i % 3 == 0 {
+                                    tree.prefix_match(&text);
+                                } else {
+                                    tree.insert(&text, tenant);
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+
+                for h in handles {
+                    h.join().unwrap();
+                }
             }
+            let duration = start.elapsed();
+
+            if !printed.load(Ordering::Relaxed) {
+                let total_ops = iters * 8 * 100;
+                let ops_per_sec = total_ops as f64 / duration.as_secs_f64();
+                let result = format!(
+                    "{:<25} | {:>12.0} | {:>12}",
+                    "concurrent_8_threads",
+                    ops_per_sec,
+                    "PASS"
+                );
+                add_result("summary", result);
+                printed.store(true, Ordering::Relaxed);
+            }
+
+            duration
         });
     });
 
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_insert_throughput,
-    bench_prefix_match_latency,
-    bench_concurrent_operations,
-    bench_eviction,
-    bench_utf8_vs_ascii,
-    bench_multi_tenant,
-    bench_summary,
-);
+/// Print final summary table
+fn print_summary() {
+    println!("\n{}", "=".repeat(100));
+    println!("RADIX TREE BENCHMARK SUMMARY (Cache-Aware Routing)");
+    println!("{}", "=".repeat(100));
+
+    let results = BENCHMARK_RESULTS.lock().unwrap();
+
+    let mut current_category = String::new();
+    for (key, value) in results.iter() {
+        let category = key.split('_').skip(1).collect::<Vec<_>>().join("_");
+
+        if category != current_category {
+            current_category = category.clone();
+
+            // Print section header based on category
+            println!("\n{}", "-".repeat(100));
+            match category.as_str() {
+                "insert" => {
+                    println!("INSERT THROUGHPUT (10 endpoint tenants)");
+                    println!(
+                        "{:<25} | {:>8} | {:>12} | {:>10}",
+                        "Test Case", "Size", "Ops/sec", "Tenants"
+                    );
+                }
+                "prefix_match" => {
+                    println!("PREFIX MATCH LATENCY");
+                    println!(
+                        "{:<20} | {:>12} | {:>12}",
+                        "Match Type", "Ops/sec", "Latency(ns)"
+                    );
+                }
+                "concurrent" => {
+                    println!("CONCURRENT OPERATIONS (mixed read/write)");
+                    println!(
+                        "{:<25} | {:>8} | {:>12} | {:>12}",
+                        "Configuration", "Threads", "Total Ops/s", "Per-Thread"
+                    );
+                }
+                "eviction" => {
+                    println!("EVICTION PERFORMANCE");
+                    println!(
+                        "{:<25} | {:>8} | {:>12} | {:>12}",
+                        "Configuration", "Size", "Ops/sec", "Latency(ms)"
+                    );
+                }
+                "encoding" => {
+                    println!("ENCODING (ASCII vs UTF-8)");
+                    println!(
+                        "{:<20} | {:>12} | {:>12}",
+                        "Encoding", "Ops/sec", "Comparison"
+                    );
+                }
+                "multi_tenant" => {
+                    println!("MULTI-TENANT SCENARIOS (10 HTTP/gRPC endpoints)");
+                    println!(
+                        "{:<30} | {:>10} | {:>12}",
+                        "Operation", "Tenants", "Ops/sec"
+                    );
+                }
+                "summary" => {
+                    println!("CI SUMMARY (representative benchmarks)");
+                    println!(
+                        "{:<25} | {:>12} | {:>12}",
+                        "Benchmark", "Ops/sec", "Status"
+                    );
+                }
+                _ => {}
+            }
+            println!("{}", "-".repeat(100));
+        }
+
+        println!("{}", value);
+    }
+
+    println!("\n{}", "=".repeat(100));
+    println!("Endpoint tenants used:");
+    for (i, tenant) in ENDPOINT_TENANTS.iter().enumerate() {
+        println!("  [{}] {}", i, tenant);
+    }
+    println!("{}", "=".repeat(100));
+}
+
+fn run_benchmarks(c: &mut Criterion) {
+    bench_insert_throughput(c);
+    bench_prefix_match_latency(c);
+    bench_concurrent_operations(c);
+    bench_eviction(c);
+    bench_utf8_vs_ascii(c);
+    bench_multi_tenant(c);
+    bench_summary(c);
+
+    // Print summary at the end
+    print_summary();
+}
+
+criterion_group!(benches, run_benchmarks);
 criterion_main!(benches);
