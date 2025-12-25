@@ -345,11 +345,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
+            load=recv_obj.load,
             queue_time=recv_obj.queue_time,
             forward_entry_time=recv_obj.forward_entry_time,
             prefill_launch_delay=recv_obj.prefill_launch_delay,
             prefill_launch_latency=recv_obj.prefill_launch_latency,
-            load=recv_obj.load,
             prefill_finished_ts=recv_obj.prefill_finished_ts,
         )
 

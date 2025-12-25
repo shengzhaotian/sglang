@@ -1704,14 +1704,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
                 self.record_request_for_crash_dump(state, out_dict)
 
-        # When skip_tokenizer_init is enabled, tokensizer_manager receives
-        # BatchTokenIDOutput.
-        if self.server_args.dp_size > 1 and (
-            isinstance(recv_obj, BatchStrOutput)
-            or isinstance(recv_obj, BatchTokenIDOutput)
+        # Update load for DP balance.
+        if self.server_args.dp_size > 1 and isinstance(
+            recv_obj, (BatchStrOutput, BatchTokenIDOutput)
         ):
             load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
-            self.send_to_scheduler.send_pyobj(load_update_req)
+            self.send_to_data_parallel_controller.send_pyobj(load_update_req)
 
     def add_logprob_to_meta_info(
         self,
