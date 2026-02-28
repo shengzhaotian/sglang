@@ -172,6 +172,7 @@ from sglang.srt.managers.utils import GenerationBatchResult, validate_input_leng
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.req_time_stats import (
@@ -721,9 +722,9 @@ class Scheduler(
             else:
                 self.tree_cache = RadixCache(params)
 
-        from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
+        if server_args.enable_streaming_session:
 
-        self.tree_cache = SessionAwareCache(self.tree_cache)
+            self.tree_cache = SessionAwareCache(self.tree_cache)
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -794,6 +795,7 @@ class Scheduler(
             self.schedule_low_priority_values_first,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
+        self.max_prefill_bs: int = 0
         if self.server_args.enable_prefill_delayer:
             self.prefill_delayer = PrefillDelayer(
                 dp_size=self.dp_size,
@@ -805,6 +807,11 @@ class Scheduler(
                 ),
                 max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
                 token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
+                device=(
+                    self.tp_group.device
+                    if self.server_args.disable_overlap_schedule
+                    else "cpu"
+                ),
             )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
@@ -2049,6 +2056,8 @@ class Scheduler(
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
+            max_prefill_bs=self.max_prefill_bs,
+            max_running_requests=self.max_running_requests,
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
@@ -2163,6 +2172,7 @@ class Scheduler(
             self.spec_algorithm,
             chunked_req=self.chunked_req,
         )
+        self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
@@ -2928,7 +2938,6 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        # handle error
         session_id = recv_req.session_id
         if session_id in self.sessions:
             logger.warning(f"session id {session_id} already exist, cannot open.")
@@ -2959,7 +2968,8 @@ class Scheduler(
             req = next(iter(session.req_nodes.values())).req
             if not req.finished():
                 req.session = None
-        self.tree_cache.release_session(session_id)
+        if isinstance(self.tree_cache, SessionAwareCache):
+            self.tree_cache.release_session(session_id)
         del self.sessions[session_id]
 
     def reap_timed_out_sessions(self):
