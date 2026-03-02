@@ -182,7 +182,7 @@ class Qwen3Attention(nn.Module):
             hidden_states = hidden_states.bfloat16()
 
         if (
-            not _is_npu 
+            not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         ):
             q, k, v = self.forward_prepare_native(
