@@ -9,6 +9,82 @@
 from transformers import PretrainedConfig
 
 
+class Glm4MoeLiteConfig(PretrainedConfig):
+    """Configuration class for GLM-4.7-Flash (Glm4MoeLite) model.
+
+    This model uses MLA (Multi-Latent Attention) and MoE (Mixture of Experts)
+    architecture, similar to DeepSeek V2/V3.
+    """
+
+    model_type = "glm4_moe_lite"
+
+    def __init__(
+        self,
+        hidden_size: int = 2048,
+        intermediate_size: int = 10240,
+        moe_intermediate_size: int = 1536,
+        num_hidden_layers: int = 47,
+        num_attention_heads: int = 20,
+        num_key_value_heads: int = 20,
+        n_routed_experts: int = 64,
+        n_shared_experts: int = 1,
+        num_experts_per_tok: int = 4,
+        first_k_dense_replace: int = 1,
+        moe_layer_freq: int = 1,
+        n_group: int = 1,
+        topk_group: int = 1,
+        topk_method: str = "noaux_tc",
+        norm_topk_prob: bool = True,
+        routed_scaling_factor: float = 1.8,
+        q_lora_rank: int = 768,
+        kv_lora_rank: int = 512,
+        qk_nope_head_dim: int = 192,
+        qk_rope_head_dim: int = 64,
+        v_head_dim: int = 256,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 202752,
+        rms_norm_eps: float = 1e-5,
+        vocab_size: int = 154880,
+        rope_theta: float = 1000000.0,
+        attention_bias: bool = False,
+        attention_dropout: float = 0.0,
+        num_nextn_predict_layers: int = 1,
+        tie_word_embeddings: bool = False,
+        **kwargs,
+    ):
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.moe_intermediate_size = moe_intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.n_routed_experts = n_routed_experts
+        self.n_shared_experts = n_shared_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.first_k_dense_replace = first_k_dense_replace
+        self.moe_layer_freq = moe_layer_freq
+        self.n_group = n_group
+        self.topk_group = topk_group
+        self.topk_method = topk_method
+        self.norm_topk_prob = norm_topk_prob
+        self.routed_scaling_factor = routed_scaling_factor
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.hidden_act = hidden_act
+        self.max_position_embeddings = max_position_embeddings
+        self.rms_norm_eps = rms_norm_eps
+        self.vocab_size = vocab_size
+        self.rope_theta = rope_theta
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
+        self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.tie_word_embeddings = tie_word_embeddings
+        super().__init__(**kwargs)
+
+
 class ChatGLMConfig(PretrainedConfig):
     model_type = "chatglm"
     attribute_map = {

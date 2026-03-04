@@ -1,6 +1,6 @@
 from sglang.srt.configs.afmoe import AfmoeConfig
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
-from sglang.srt.configs.chatglm import ChatGLMConfig
+from sglang.srt.configs.chatglm import ChatGLMConfig, Glm4MoeLiteConfig
 from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
 from sglang.srt.configs.dots_ocr import DotsOCRConfig
@@ -37,6 +37,7 @@ __all__ = [
     "ChatGLMConfig",
     "DbrxConfig",
     "DeepseekVL2Config",
+    "Glm4MoeLiteConfig",
     "LongcatFlashConfig",
     "MultiModalityConfig",
     "KimiVLConfig",

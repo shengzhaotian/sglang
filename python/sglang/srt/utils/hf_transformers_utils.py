@@ -53,6 +53,7 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
+    Glm4MoeLiteConfig,
     GraniteMoeHybridConfig,
     JetNemotronConfig,
     JetVLMConfig,
@@ -84,6 +85,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     DbrxConfig,
     ExaoneConfig,
     DeepseekVL2Config,
+    Glm4MoeLiteConfig,
     MultiModalityConfig,
     KimiVLConfig,
     InternVLChatConfig,
@@ -316,11 +318,14 @@ def get_config(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
             )
         except ValueError as e:
-            if not "deepseek_v32" in str(e):
+            if "deepseek_v32" in str(e):
+                config = _load_deepseek_v32_model(
+                    model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+                )
+            elif "glm4_moe_lite" in str(e):
+                config = Glm4MoeLiteConfig.from_pretrained(model, revision=revision)
+            else:
                 raise e
-            config = _load_deepseek_v32_model(
-                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-            )
 
     if (
         config.architectures is not None
