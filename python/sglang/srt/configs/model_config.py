@@ -103,6 +103,7 @@ class ModelConfig:
         encoder_only: bool = False,
         language_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
+        disable_mtp: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -114,6 +115,7 @@ class ModelConfig:
         self.quantize_and_serve = quantize_and_serve
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.disable_hybrid_swa_memory = disable_hybrid_swa_memory
+        self.disable_mtp = disable_mtp
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -270,6 +272,7 @@ class ModelConfig:
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
+            disable_mtp=server_args.disable_cuda_graph,
             **kwargs,
         )
 
@@ -523,6 +526,17 @@ class ModelConfig:
                 scaling_factor = self.hf_config.rope_scaling["factor"]
                 mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                 self.scaling = self.scaling * mscale * mscale
+        elif "Glm4MoeLiteForCausalLM" in self.hf_config.architectures:
+            # GLM-4.7-flash uses MLA attention
+            self.head_dim = (
+                self.hf_config.qk_nope_head_dim + self.hf_config.qk_rope_head_dim
+            )
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.v_head_dim = self.hf_config.v_head_dim
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -580,6 +594,9 @@ class ModelConfig:
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
+        # Disable MTP when cuda graph is disabled (MTP requires ACLGraph on NPU)
+        if self.disable_mtp and self.num_nextn_predict_layers is not None:
+            self.num_nextn_predict_layers = None
         self.vocab_size = self.hf_text_config.vocab_size
 
     def get_total_num_attention_heads(self) -> int:

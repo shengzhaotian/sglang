@@ -36,6 +36,9 @@ def _dispatch_mla_subtype(attn, forward_batch):
 
 
 def handle_attention_ascend(attn, forward_batch):
+    # Check if the model uses MLA architecture
+    is_mla = hasattr(attn, "kv_lora_rank") and attn.kv_lora_rank is not None
+
     if (
         forward_batch.forward_mode.is_extend()
         and not forward_batch.forward_mode.is_target_verify()
@@ -44,6 +47,9 @@ def handle_attention_ascend(attn, forward_batch):
     ):
         if hasattr(attn, "indexer"):
             return AttnForwardMethod.DSA_NPU
+        elif is_mla:
+            # MLA models should use MLA_NPU path for proper KV cache handling
+            return AttnForwardMethod.MLA_NPU
         else:
             return AttnForwardMethod.MHA_NPU
     else:

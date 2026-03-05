@@ -113,7 +113,12 @@ def forward_mha_prepare_npu(
         kv_a = m.kv_a_layernorm(kv_a)
         k_pe = latent_cache[:, :, m.kv_lora_rank :]
         if m.rotary_emb is not None:
-            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+            # GLM4-7-flash has v_head_dim == qk_head_dim (both 256), which is incompatible
+            # with npu_mrope. Use native rotary embedding for such models.
+            if m.v_head_dim == m.qk_head_dim:
+                q_pe, k_pe = m.rotary_emb.forward_native(positions, q_pe, k_pe)
+            else:
+                q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
         # this is for model kimi-vl-a3B-instruct
         forward_batch.token_to_kv_pool.set_kv_buffer(
             m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
@@ -227,7 +232,12 @@ def forward_mla_prepare_npu(
         if nsa_use_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        # GLM4-7-flash has v_head_dim == qk_head_dim (both 256), which is incompatible
+        # with npu_mrope. Use native rotary embedding for such models.
+        if m.v_head_dim == m.qk_head_dim:
+            q_pe, k_pe = m.rotary_emb.forward_native(positions, q_pe, k_pe)
+        else:
+            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if nsa_use_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
             # support allgather+rerrange

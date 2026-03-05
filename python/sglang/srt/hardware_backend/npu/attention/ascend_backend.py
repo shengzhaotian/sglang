@@ -1004,10 +1004,95 @@ class AscendAttnBackend(AttentionBackend):
                     dim=0,
                 )
         else:
-            assert (
-                layer.qk_head_dim != layer.v_head_dim
-            ), "FIA only supports qk_head_dim != v_head_dim"
-            if layer.v_head_dim in [256]:
+            # MLA path: q is q_nope_out with kv_lora_rank dimensions
+            # q_rope and k_rope are provided separately
+            if q_rope is not None and k_rope is not None:
+                # GLM4-7-flash style: q is already compressed, rope parts provided separately
+                # Use native SDPA for MLA attention
+                if save_kv_cache:
+                    # k is k_nope with kv_lora_rank dimensions
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, forward_batch.out_cache_loc, k, k_rope
+                    )
+
+                # For pure extend (no prefix), use current k and k_rope directly
+                # For extend with prefix, we need to combine current and cached KV
+                num_token_padding = q.shape[0]
+                q_trimmed = q[: forward_batch.num_token_non_padded_cpu]
+                k_trimmed = k[: forward_batch.num_token_non_padded_cpu]
+                k_rope_trimmed = k_rope[: forward_batch.num_token_non_padded_cpu]
+                q_rope_trimmed = q_rope[: forward_batch.num_token_non_padded_cpu]
+
+                # Compute k_nope and v from c_kv using kv_b_proj
+                if hasattr(layer, 'kv_b_proj') and layer.kv_b_proj is not None:
+                    kv = layer.kv_b_proj(k_trimmed)[0].view(
+                        -1, layer.tp_k_head_num, self.qk_nope_head_dim + layer.v_head_dim
+                    )
+                    k_nope, v = kv.split([self.qk_nope_head_dim, layer.v_head_dim], dim=-1)
+                else:
+                    # Fallback: use k as k_nope and create placeholder v
+                    k_nope = k_trimmed.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
+                    v = torch.zeros(
+                        k_trimmed.shape[0],
+                        layer.tp_k_head_num,
+                        layer.v_head_dim,
+                        dtype=k_trimmed.dtype,
+                        device=k_trimmed.device,
+                    )
+
+                # Expand k_rope to match head dimension
+                k_rope_expanded = k_rope_trimmed.view(-1, 1, self.qk_rope_head_dim).expand(-1, layer.tp_k_head_num, -1)
+
+                # Concatenate k_nope with k_rope to form full key
+                k_full = torch.cat([k_nope, k_rope_expanded], dim=-1)
+
+                # Decompress query back to full dimension using w_kc
+                # q has shape [num_tokens, num_heads, kv_lora_rank]
+                if hasattr(layer, 'w_kc') and layer.w_kc is not None:
+                    # w_kc shape: [num_heads, kv_lora_rank, qk_nope_head_dim]
+                    q_nope_full = torch.bmm(
+                        q_trimmed.view(-1, layer.tp_q_head_num, self.kv_lora_rank).transpose(0, 1),
+                        layer.w_kc
+                    ).transpose(0, 1)
+                else:
+                    q_nope_full = q_trimmed.view(-1, layer.tp_q_head_num, self.kv_lora_rank)
+
+                # Concatenate q_nope with q_rope to form full query
+                q_full = torch.cat([q_nope_full, q_rope_trimmed], dim=-1)
+
+                attn_output = q_full.new_empty(
+                    (q_full.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+                )
+
+                use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+
+                attn_output = self.native_attn.run_sdpa_forward_extend(
+                    q_full,
+                    attn_output,
+                    k_full,
+                    v,
+                    forward_batch.req_to_token_pool.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.extend_prefix_lens,
+                    forward_batch.extend_seq_lens,
+                    scaling=layer.scaling,
+                    enable_gqa=use_gqa,
+                    causal=True,
+                )
+
+                if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                    attn_output = torch.cat(
+                        [
+                            attn_output,
+                            attn_output.new_zeros(
+                                num_token_padding - attn_output.shape[0],
+                                *attn_output.shape[1:],
+                            ),
+                        ],
+                        dim=0,
+                    )
+            elif layer.v_head_dim in [256]:
                 """Currently, in NO_QUANT situation, qk_nope_head_dim == v_head_dim, and rope exists, v_head_dim only support 512 and 128"""
                 kv_lora_rank = k.shape[-1] - self.qk_rope_head_dim
                 kv_c, k_rope = k.split([kv_lora_rank, self.qk_rope_head_dim], dim=-1)
