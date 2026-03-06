@@ -233,6 +233,138 @@ Key arguments for `launch_server`:
 - Ascend NPUs
 - Intel XPUs
 
+## 7. Ascend NPU Support
+
+### Architecture
+
+NPU-specific code is isolated in `hardware_backend/npu/`:
+
+```
+python/sglang/srt/hardware_backend/npu/
+├── attention/           # NPU attention backends (FIA, Paged Attention)
+├── graph_runner/        # ACLGraph implementation
+├── modules/             # NPU-specific model modules (e.g., MLA)
+├── moe/                 # MoE optimizations
+├── quantization/        # ModelSlim quantization support
+└── utils.py             # NPU utilities
+```
+
+### Installation
+
+```bash
+# Prerequisites: CANN toolkit and torch_npu
+pip install torch-npu
+
+# Install SGLang from source
+pip install -e "python"
+```
+
+### Launching Server
+
+```bash
+# Basic NPU server
+python3 -m sglang.launch_server \
+    --model-path /models/llama-7b \
+    --attention-backend ascend \
+    --device npu \
+    --port 30000
+
+# With tensor parallelism
+python3 -m sglang.launch_server \
+    --model-path /models/deepseek-v3 \
+    --tp-size 16 \
+    --attention-backend ascend \
+    --device npu
+```
+
+### Key Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ASCEND_USE_FIA` | Enable FIA attention backend | `false` |
+| `SGLANG_NPU_USE_MLAPO` | Enable MLA preprocessing optimization | `false` |
+| `SGLANG_USE_FIA_NZ` | Enable NZ format for FIA | `false` |
+| `HCCL_BUFFSIZE` | HCCL buffer size | `1600` |
+
+### Code Conventions for NPU
+
+1. **Branch Isolation**: Use `is_npu()` for NPU-specific paths
+   ```python
+   from sglang.srt.utils import is_npu
+   _is_npu = is_npu()
+   
+   if _is_npu:
+       # NPU-specific implementation
+       pass
+   else:
+       # CUDA/general implementation
+       pass
+   ```
+
+2. **Code Location**: NPU-specific implementations go in `hardware_backend/npu/`
+
+3. **Reuse First**: Reuse existing model classes when possible, add NPU branches
+
+4. **Testing**: Always verify existing CUDA path still works after NPU changes
+
+### NPU-Specific Features
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| FIA (Fused Infer Attention) | ✅ | Enable with `ASCEND_USE_FIA=1` |
+| ACLGraph | ✅ | Graph capture for decode optimization |
+| DeepEP | ✅ | MoE communication optimization |
+| DP Attention | ✅ | Data parallel attention |
+| Speculative Decoding | ✅ | EAGLE/EAGLE3 support |
+| ModelSlim Quantization | ✅ | W8A8, W4A4 quantization |
+
+### Testing on NPU
+
+```bash
+# Run NPU-specific tests
+python3 test/srt/test_srt_endpoint.py --device npu
+
+# Run with NPU hardware flag
+python3 test/run_suite.py --hw npu --suite stage-b-test-small-1-gpu
+```
+
+### NPU-Specific Skills
+
+For NPU-related tasks, use the specialized skills:
+
+| Skill | Purpose | When to Invoke |
+|-------|---------|----------------|
+| `sglang-model-adapter` | Model adaptation and debugging | Adapting new models, fixing NPU compatibility issues |
+| `npu-testing-workflow` | Testing and benchmarking | Performance evaluation, test report generation |
+
+### NPU Workflow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    NPU Model Development Workflow                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. Model Adaptation (sglang-model-adapter)                     │
+│     ├── Analyze model architecture                              │
+│     ├── Implement NPU support (branch isolation)                │
+│     ├── Validate with dummy weights                             │
+│     └── Validate with real weights                              │
+│                         ↓                                        │
+│  2. Completion Criteria                                         │
+│     ├── Basic functional tests (mandatory)                      │
+│     ├── Performance benchmark (recommended)                     │
+│     └── Accuracy test (optional)                                │
+│                         ↓                                        │
+│  3. Comprehensive Testing (npu-testing-workflow)                │
+│     ├── Service deployment scripts                              │
+│     ├── Client benchmarking                                     │
+│     └── Test report generation                                  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Workflow**: Use `sglang-model-adapter` first for model adaptation, then `npu-testing-workflow` for validation and benchmarking.
+
 ## CI Commands
 
 Authorized users can comment on PRs:
