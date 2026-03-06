@@ -1,39 +1,39 @@
 # NPU RoPE (Rotary Position Embedding) Reference
 
-## 概述
+## Overview
 
-旋转位置编码 (RoPE) 是现代 LLM 的核心组件。在 NPU 上，RoPE 的实现有其特殊性，需要特别注意算子选择和数据布局。
+Rotary Position Embedding (RoPE) is a core component of modern LLMs. On NPU, RoPE implementation has specific characteristics that require special attention to operator selection and data layout.
 
-## 核心实现位置
+## Core Implementation Locations
 
 ```
-python/sglang/srt/layers/rotary_embedding.py       # 通用 RoPE 实现
+python/sglang/srt/layers/rotary_embedding.py       # General RoPE implementation
 python/sglang/srt/hardware_backend/npu/attention/
-├── ascend_backend.py                              # RoPE 在 attention 中的使用
-└── mla_preprocess.py                              # MLA 模型的 RoPE 预处理
+├── ascend_backend.py                              # RoPE usage in attention
+└── mla_preprocess.py                              # RoPE preprocessing for MLA models
 ```
 
-## NPU RoPE 算子
+## NPU RoPE Operators
 
 ### npu_interleave_rope
 
-**用途**: NPU 专用的交错 RoPE 算子
+**Purpose**: NPU-specific interleaved RoPE operator
 
-**函数签名**:
+**Function Signature**:
 ```python
 torch.ops.npu.npu_interleave_rope(
-    x,           # [Batch, Num_heads, Seq_len, Head_dim] 或 [B*S, N, 1, D]
-    cos,         # 余弦值
-    sin,         # 正弦值
+    x,           # [Batch, Num_heads, Seq_len, Head_dim] or [B*S, N, 1, D]
+    cos,         # Cosine values
+    sin,         # Sine values
 )
 ```
 
-**特点**:
-- 适用于 MLA 模型的 RoPE 部分
-- 输入需要 reshape 为 4D tensor
-- `cos` 和 `sin` 需要预先计算并缓存
+**Features**:
+- Suitable for RoPE part of MLA models
+- Input needs to be reshaped to 4D tensor
+- `cos` and `sin` need to be pre-calculated and cached
 
-**使用示例** (来自 `mla_preprocess.py`):
+**Usage Example** (from `mla_preprocess.py`):
 ```python
 q_pe = q_pe.view(-1, self.num_local_heads, 1, self.qk_rope_head_dim)
 cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
@@ -43,51 +43,51 @@ q_pe = torch.ops.npu.npu_interleave_rope(q_pe, cos, sin)
 
 ### npu_kv_rmsnorm_rope_cache
 
-**用途**: 融合 RMSNorm + RoPE + KV Cache 写入
+**Purpose**: Fused RMSNorm + RoPE + KV Cache write
 
-**函数签名**:
+**Function Signature**:
 ```python
 torch.ops.npu.npu_kv_rmsnorm_rope_cache(
     latent_cache,      # [B*S, 1, 1, kv_lora_rank + qk_rope_head_dim]
-    rmsnorm_weight,    # LayerNorm 权重
-    cos,               # 余弦值
-    sin,               # 正弦值
-    slot_mapping,      # Cache 写入位置
-    k_rope_cache,      # K RoPE cache 输出
-    c_kv_cache,        # C KV cache 输出
+    rmsnorm_weight,    # LayerNorm weight
+    cos,               # Cosine values
+    sin,               # Sine values
+    slot_mapping,      # Cache write location
+    k_rope_cache,      # K RoPE cache output
+    c_kv_cache,        # C KV cache output
     epsilon,           # RMSNorm epsilon
-    cache_mode,        # "PA_BNSD" 或 "PA_NZ"
-    is_output_kv,      # 是否输出 KV
+    cache_mode,        # "PA_BNSD" or "PA_NZ"
+    is_output_kv,      # Whether to output KV
 )
 ```
 
-**返回**: `(k_pe, k_nope, ...)` 或根据参数返回多个值
+**Returns**: `(k_pe, k_nope, ...)` or multiple values depending on parameters
 
-**使用场景**: MLA 模型的 KV cache 预处理
+**Use Case**: KV cache preprocessing for MLA models
 
-## RoPE 维度说明
+## RoPE Dimension Specifications
 
-### 标准 RoPE 模型
+### Standard RoPE Models
 
-| 模型 | RoPE 维度 | 总 Head Dim |
-|------|-----------|-------------|
+| Model | RoPE Dimension | Total Head Dim |
+|-------|----------------|----------------|
 | LLaMA | 128 | 128 |
 | Qwen2 | 128 | 128 |
 | Mistral | 128 | 128 |
 
-### MLA 模型 (DeepSeek-V2/V3)
+### MLA Models (DeepSeek-V2/V3)
 
-| 组件 | 维度 | 说明 |
-|------|------|------|
-| `qk_rope_head_dim` | 64 | RoPE 部分维度 |
-| `qk_nope_head_dim` | 128 | 非 RoPE 部分维度 |
-| `qk_head_dim` | 192 | 总维度 |
+| Component | Dimension | Description |
+|-----------|-----------|-------------|
+| `qk_rope_head_dim` | 64 | RoPE part dimension |
+| `qk_nope_head_dim` | 128 | Non-RoPE part dimension |
+| `qk_head_dim` | 192 | Total dimension |
 
-**关键区别**: MLA 模型将 Q 和 K 分为 RoPE 和非 RoPE 两部分，只有 RoPE 部分应用位置编码。
+**Key Difference**: MLA models split Q and K into RoPE and non-RoPE parts, with position encoding applied only to the RoPE part.
 
-## RoPE 计算流程
+## RoPE Computation Flow
 
-### 非 MLA 模型
+### Non-MLA Models
 
 ```
 positions → rotary_emb.get_cos_sin_cache() → cos, sin
@@ -95,7 +95,7 @@ positions → rotary_emb.get_cos_sin_cache() → cos, sin
 q, k → rotary_emb(positions, q, k) → q_rotated, k_rotated
 ```
 
-### MLA 模型
+### MLA Models
 
 ```
 positions → get_sin_cos() → cos, sin
@@ -107,10 +107,10 @@ latent_cache → npu_kv_rmsnorm_rope_cache(...) → k_pe, k_nope
 
 ## DeepSeek Yarn RoPE
 
-DeepSeek 模型使用特殊的 Yarn RoPE 扩展：
+DeepSeek models use special Yarn RoPE extension:
 
 ```python
-# 在 deepseek_v2_attention_mla_npu.py 中
+# In deepseek_v2_attention_mla_npu.py
 if m.use_deepseek_yarn_rope:
     cos, sin = m.rotary_emb.get_cos_sin_cache(positions, dtype, offsets=None)
     q_pe = torch_npu.npu_interleave_rope(
@@ -119,9 +119,9 @@ if m.use_deepseek_yarn_rope:
     )
 ```
 
-## Cos/Sin Cache 管理
+## Cos/Sin Cache Management
 
-### 标准实现
+### Standard Implementation
 
 ```python
 class RotaryEmbedding:
@@ -130,74 +130,74 @@ class RotaryEmbedding:
         self.sin_cached = None
     
     def get_cos_sin_cache(self, positions, dtype, offsets=None):
-        # 计算或返回缓存的 cos/sin
+        # Calculate or return cached cos/sin
 ```
 
-### NPU 优化实现
+### NPU Optimized Implementation
 
 ```python
-# 在 mla_preprocess.py 中
+# In mla_preprocess.py
 def get_sin_cos(self, positions):
     cos_sin = self.rotary_emb.cos_sin_cache[positions]
     cos, sin = cos_sin.chunk(2, dim=-1)
-    cos = cos.repeat(1, 2)  # 扩展维度
+    cos = cos.repeat(1, 2)  # Expand dimension
     sin = sin.repeat(1, 2)
     return cos, sin
 ```
 
-## 常见问题排查
+## Common Issue Troubleshooting
 
-### 1. 维度不匹配
+### 1. Dimension Mismatch
 
-**症状**: `RuntimeError: shape mismatch in npu_interleave_rope`
+**Symptom**: `RuntimeError: shape mismatch in npu_interleave_rope`
 
-**检查点**:
-- 输入是否为 4D tensor
-- `qk_rope_head_dim` 是否正确
-- `cos` 和 `sin` 的维度是否与 `q_pe` 匹配
+**Checkpoints**:
+- Is input a 4D tensor
+- Is `qk_rope_head_dim` correct
+- Do `cos` and `sin` dimensions match `q_pe`
 
-**解决方案**:
+**Solution**:
 ```python
-# 确保正确的 reshape
+# Ensure correct reshape
 q_pe = q_pe.view(-1, num_heads, 1, qk_rope_head_dim)
 cos = cos.view(-1, 1, 1, qk_rope_head_dim)
 sin = sin.view(-1, 1, 1, qk_rope_head_dim)
 ```
 
-### 2. 位置编码错误
+### 2. Position Encoding Errors
 
-**症状**: 模型输出乱码或精度下降
+**Symptom**: Model outputs garbled text or accuracy degradation
 
-**检查点**:
-- `positions` tensor 是否正确 (从 0 开始)
-- `cos_sin_cache` 是否正确初始化
-- 是否使用了正确的 RoPE 类型 (标准 vs Yarn)
+**Checkpoints**:
+- Is `positions` tensor correct (starting from 0)
+- Is `cos_sin_cache` correctly initialized
+- Is the correct RoPE type used (standard vs Yarn)
 
-### 3. Cache 未正确更新
+### 3. Cache Not Correctly Updated
 
-**症状**: 长序列推理出错
+**Symptom**: Long sequence inference errors
 
-**检查点**:
-- `slot_mapping` 是否正确映射到 cache 位置
-- `cache_mode` 是否与实际 cache 布局匹配
-- 检查 `npu_kv_rmsnorm_rope_cache` 的输出是否正确写入
+**Checkpoints**:
+- Is `slot_mapping` correctly mapping to cache locations
+- Does `cache_mode` match actual cache layout
+- Check if `npu_kv_rmsnorm_rope_cache` output is correctly written
 
-### 4. MLA 模型 RoPE 分离问题
+### 4. MLA Model RoPE Separation Issues
 
-**症状**: `q_nope` 和 `q_pe` 分离错误
+**Symptom**: `q_nope` and `q_pe` separation errors
 
-**检查点**:
+**Checkpoints**:
 ```python
-# 正确的分离方式
+# Correct separation
 q_nope, q_pe = q.split([qk_nope_head_dim, qk_rope_head_dim], dim=-1)
 
-# 错误方式 (维度顺序错误)
+# Wrong way (dimension order error)
 q_pe, q_nope = q.split([qk_rope_head_dim, qk_nope_head_dim], dim=-1)
 ```
 
-## 调试建议
+## Debugging Suggestions
 
-### 1. 打印中间结果
+### 1. Print Intermediate Results
 
 ```python
 def forward(self, positions, hidden_states, ...):
@@ -208,31 +208,31 @@ def forward(self, positions, hidden_states, ...):
     print(f"q_pe after rope: {q_pe.shape}")
 ```
 
-### 2. 验证 cos/sin 值
+### 2. Verify cos/sin Values
 
 ```python
-# 检查 cos/sin 是否在合理范围
+# Check if cos/sin are in reasonable range
 assert cos.min() >= -1.0 and cos.max() <= 1.0
 assert sin.min() >= -1.0 and sin.max() <= 1.0
 ```
 
-### 3. 对比 CPU 实现
+### 3. Compare with CPU Implementation
 
 ```python
-# 使用 PyTorch 标准 RoPE 实现对比
+# Use PyTorch standard RoPE implementation for comparison
 def reference_rope(x, cos, sin):
-    # 标准 RoPE 实现
+    # Standard RoPE implementation
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 ```
 
-## 与其他模块的关系
+## Relationship with Other Modules
 
 ```
 RoPE
-├── 输入: positions (来自 tokenizer)
-├── 依赖: rotary_emb (模型初始化时创建)
-├── 输出: q_pe, k_pe (传递给 attention backend)
-└── 与 KV Cache 交互: npu_kv_rmsnorm_rope_cache
+├── Input: positions (from tokenizer)
+├── Dependency: rotary_emb (created during model initialization)
+├── Output: q_pe, k_pe (passed to attention backend)
+└── Interaction with KV Cache: npu_kv_rmsnorm_rope_cache
 ```

@@ -1,80 +1,80 @@
 # NPU Environment Variables Reference
 
-## 概述
+## Overview
 
-NPU 推理依赖多个环境变量来控制行为和优化性能。本文档列出所有相关环境变量及其用途。
+NPU inference relies on multiple environment variables to control behavior and optimize performance. This document lists all relevant environment variables and their purposes.
 
-## 核心环境变量
+## Core Environment Variables
 
-### SGLang 通用变量
+### SGLang General Variables
 
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `SGLANG_SET_CPU_AFFINITY` | 0 | 设置 CPU 亲和性 |
-| `SGLANG_ENABLE_TORCH_COMPILE` | true | 启用 torch.compile |
-| `SGLANG_IS_FLASHINFER_AVAILABLE` | true | FlashInfer 可用性检查 |
+| Variable Name | Default | Description |
+|---------------|---------|-------------|
+| `SGLANG_SET_CPU_AFFINITY` | 0 | Set CPU affinity |
+| `SGLANG_ENABLE_TORCH_COMPILE` | true | Enable torch.compile |
+| `SGLANG_IS_FLASHINFER_AVAILABLE` | true | FlashInfer availability check |
 
-### NPU 专用变量
+### NPU-Specific Variables
 
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `ASCEND_USE_FIA` | False | 启用 FIA (Fused Infer Attention) 后端 |
-| `SGLANG_NPU_USE_MLAPO` | False | 启用 MLAPO 预处理优化 |
-| `SGLANG_USE_FIA_NZ` | False | 启用 NZ 格式 (需配合 MLAPO) |
-| `SGLANG_ENABLE_OVERLAP_PLAN_STREAM` | 0 | 启用流重叠优化 |
-| `SGLANG_ENABLE_SPEC_V2` | 0 | 启用推测解码 V2 |
+| Variable Name | Default | Description |
+|---------------|---------|-------------|
+| `ASCEND_USE_FIA` | False | Enable FIA (Fused Infer Attention) backend |
+| `SGLANG_NPU_USE_MLAPO` | False | Enable MLAPO preprocessing optimization |
+| `SGLANG_USE_FIA_NZ` | False | Enable NZ format (requires MLAPO) |
+| `SGLANG_ENABLE_OVERLAP_PLAN_STREAM` | 0 | Enable stream overlap optimization |
+| `SGLANG_ENABLE_SPEC_V2` | 0 | Enable speculative decoding V2 |
 
-## 内存相关变量
+## Memory-Related Variables
 
-| 变量名 | 说明 | 推荐值 |
-|--------|------|--------|
-| `PYTORCH_NPU_ALLOC_CONF` | NPU 内存分配配置 | `expandable_segments:True` |
-| `STREAMS_PER_DEVICE` | 每设备流数量 | 32 |
+| Variable Name | Description | Recommended Value |
+|---------------|-------------|-------------------|
+| `PYTORCH_NPU_ALLOC_CONF` | NPU memory allocation config | `expandable_segments:True` |
+| `STREAMS_PER_DEVICE` | Streams per device | 32 |
 
-## 通信相关变量 (HCCL)
+## Communication-Related Variables (HCCL)
 
-| 变量名 | 说明 | 推荐值 |
-|--------|------|--------|
-| `HCCL_BUFFSIZE` | HCCL 缓冲区大小 | 1600 |
-| `HCCL_SOCKET_IFNAME` | HCCL Socket 接口 | `lo` (单机) |
-| `GLOO_SOCKET_IFNAME` | Gloo Socket 接口 | `lo` (单机) |
-| `HCCL_OP_EXPANSION_MODE` | HCCL 算子扩展模式 | `AIV` |
+| Variable Name | Description | Recommended Value |
+|---------------|-------------|-------------------|
+| `HCCL_BUFFSIZE` | HCCL buffer size | 1600 |
+| `HCCL_SOCKET_IFNAME` | HCCL Socket interface | `lo` (single node) |
+| `GLOO_SOCKET_IFNAME` | Gloo Socket interface | `lo` (single node) |
+| `HCCL_OP_EXPANSION_MODE` | HCCL operator expansion mode | `AIV` |
 
-## DeepEP 相关变量 (MoE 模型)
+## DeepEP-Related Variables (MoE Models)
 
-| 变量名 | 说明 | 推荐值 |
-|--------|------|--------|
-| `DEEP_NORMAL_MODE_USE_INT8_QUANT` | DeepEP INT8 量化 | 1 |
-| `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | 每秩最大分发 token 数 | 32 |
-| `DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS` | 长序列每轮 token 数 | 1024 |
-| `DEEPEP_NORMAL_LONG_SEQ_ROUND` | 长序列轮数 | 16 |
+| Variable Name | Description | Recommended Value |
+|---------------|-------------|-------------------|
+| `DEEP_NORMAL_MODE_USE_INT8_QUANT` | DeepEP INT8 quantization | 1 |
+| `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | Max dispatch tokens per rank | 32 |
+| `DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS` | Long sequence tokens per round | 1024 |
+| `DEEPEP_NORMAL_LONG_SEQ_ROUND` | Long sequence rounds | 16 |
 
-## 系统性能变量
+## System Performance Variables
 
 ```bash
-# CPU 性能模式
+# CPU performance mode
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 
-# 内存设置
+# Memory settings
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 ```
 
-## CANN 环境设置
+## CANN Environment Setup
 
 ```bash
-# CANN 工具链
+# CANN toolkit
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
-# 编译器路径
+# Compiler path
 export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 ```
 
-## 环境变量组合推荐
+## Environment Variable Combination Recommendations
 
-### 标准 LLM 模型 (LLaMA, Qwen 等)
+### Standard LLM Models (LLaMA, Qwen, etc.)
 
 ```bash
 export ASCEND_USE_FIA=1
@@ -83,7 +83,7 @@ export STREAMS_PER_DEVICE=32
 export SGLANG_SET_CPU_AFFINITY=1
 ```
 
-### MLA 模型 (DeepSeek-V2/V3)
+### MLA Models (DeepSeek-V2/V3)
 
 ```bash
 export ASCEND_USE_FIA=1
@@ -93,7 +93,7 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 ```
 
-### MoE 模型 (DeepSeek-V3, Qwen3-MoE)
+### MoE Models (DeepSeek-V3, Qwen3-MoE)
 
 ```bash
 export ASCEND_USE_FIA=1
@@ -103,89 +103,89 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
 ```
 
-### 推测解码
+### Speculative Decoding
 
 ```bash
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 ```
 
-## 变量影响分析
+## Variable Impact Analysis
 
 ### ASCEND_USE_FIA
 
-**启用时**:
-- 使用 `npu_fused_infer_attention_score` 算子
-- 更好的性能，特别是长序列
-- 需要特定的输入布局
+**When Enabled**:
+- Uses `npu_fused_infer_attention_score` operator
+- Better performance, especially for long sequences
+- Requires specific input layout
 
-**禁用时**:
-- 使用 `_npu_flash_attention_qlens` 或 `_npu_paged_attention`
-- 兼容性更好，但性能可能较低
+**When Disabled**:
+- Uses `_npu_flash_attention_qlens` or `_npu_paged_attention`
+- Better compatibility, but potentially lower performance
 
 ### SGLANG_NPU_USE_MLAPO
 
-**启用时**:
-- 使用融合的 MLA 预处理算子
-- 减少 kernel launch 开销
-- 仅适用于 MLA 模型 (DeepSeek-V2/V3)
+**When Enabled**:
+- Uses fused MLA preprocessing operator
+- Reduces kernel launch overhead
+- Only applicable to MLA models (DeepSeek-V2/V3)
 
-**禁用时**:
-- 使用分离的预处理步骤
-- 更容易调试
+**When Disabled**:
+- Uses separate preprocessing steps
+- Easier to debug
 
 ### SGLANG_USE_FIA_NZ
 
-**启用时**:
-- KV Cache 使用 NZ (Block Major) 格式
-- 更好的 NPU 内存访问模式
-- 必须配合 `SGLANG_NPU_USE_MLAPO=1`
+**When Enabled**:
+- KV Cache uses NZ (Block Major) format
+- Better NPU memory access pattern
+- Must be combined with `SGLANG_NPU_USE_MLAPO=1`
 
-**禁用时**:
-- 使用标准 BNSD 格式
-- 更容易理解和调试
+**When Disabled**:
+- Uses standard BNSD format
+- Easier to understand and debug
 
-## 调试环境变量
+## Debugging Environment Variables
 
-| 变量名 | 说明 | 用途 |
-|--------|------|------|
-| `SGLANG_LOG_LEVEL` | 日志级别 | 调试输出 |
-| `ASCEND_GLOBAL_LOG_LEVEL` | CANN 日志级别 | 底层调试 |
-| `ASCEND_SLOG_PRINT_TO_STDOUT` | 打印到标准输出 | 日志重定向 |
+| Variable Name | Description | Purpose |
+|---------------|-------------|---------|
+| `SGLANG_LOG_LEVEL` | Log level | Debug output |
+| `ASCEND_GLOBAL_LOG_LEVEL` | CANN log level | Low-level debugging |
+| `ASCEND_SLOG_PRINT_TO_STDOUT` | Print to stdout | Log redirection |
 
-## 常见问题
+## Common Issues
 
-### 1. FIA 不可用
+### 1. FIA Not Available
 
-**症状**: 报错 "FIA not supported"
+**Symptom**: Error "FIA not supported"
 
-**检查**:
-- CANN 版本是否支持 FIA
-- `ASCEND_USE_FIA` 是否设置
+**Check**:
+- Does CANN version support FIA
+- Is `ASCEND_USE_FIA` set
 
-### 2. NZ 格式错误
+### 2. NZ Format Error
 
-**症状**: 维度不匹配错误
+**Symptom**: Dimension mismatch error
 
-**检查**:
-- `SGLANG_USE_FIA_NZ` 是否与代码逻辑一致
-- 是否同时设置了 `SGLANG_NPU_USE_MLAPO`
+**Check**:
+- Does `SGLANG_USE_FIA_NZ` match code logic
+- Is `SGLANG_NPU_USE_MLAPO` also set
 
-### 3. 内存不足
+### 3. Out of Memory
 
-**症状**: OOM 错误
+**Symptom**: OOM errors
 
-**检查**:
-- `PYTORCH_NPU_ALLOC_CONF` 设置
-- `mem_fraction_static` 参数
-- NPU 内存使用情况
+**Check**:
+- `PYTORCH_NPU_ALLOC_CONF` setting
+- `mem_fraction_static` parameter
+- NPU memory usage
 
-## 获取当前环境变量
+## Getting Current Environment Variables
 
 ```python
 from sglang.srt.utils import get_bool_env_var
 
-# 检查布尔环境变量
+# Check boolean environment variables
 use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
 use_mlapo = get_bool_env_var("SGLANG_NPU_USE_MLAPO", "False")
 use_fia_nz = get_bool_env_var("SGLANG_USE_FIA_NZ", "False")

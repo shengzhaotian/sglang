@@ -1,62 +1,62 @@
 # NPU Quantization Reference
 
-## 概述
+## Overview
 
-量化是降低模型内存占用和提升推理性能的关键技术。SGLang 在 NPU 上支持多种量化方案，本文档详细介绍 NPU 相关的量化实现。
+Quantization is a key technique for reducing model memory footprint and improving inference performance. SGLang supports multiple quantization schemes on NPU. This document details NPU-related quantization implementation.
 
-## 核心文件
+## Core Files
 
 ```
 python/sglang/srt/layers/quantization/
-├── base_config.py                  # 量化配置基类
-├── base_scheme.py                  # 量化方案基类
+├── base_config.py                  # Quantization configuration base class
+├── base_scheme.py                  # Quantization scheme base class
 ├── modelslim/
-│   ├── modelslim.py                # ModelSlim 量化配置
+│   ├── modelslim.py                # ModelSlim quantization configuration
 │   └── schemes/
-│       ├── modelslim_w8a8_int8.py  # W8A8 INT8 方案
-│       ├── modelslim_w4a4_int4.py  # W4A4 INT4 方案
-│       ├── modelslim_w4a8_int8_moe.py  # W4A8 MoE 方案
-│       └── modelslim_w8a8_int8_moe.py  # W8A8 MoE 方案
-├── compressed_tensors/             # Compressed Tensors 格式
-├── fp8.py                          # FP8 量化
-├── awq.py                          # AWQ 量化
-└── gptq.py                         # GPTQ 量化
+│       ├── modelslim_w8a8_int8.py  # W8A8 INT8 scheme
+│       ├── modelslim_w4a4_int4.py  # W4A4 INT4 scheme
+│       ├── modelslim_w4a8_int8_moe.py  # W4A8 MoE scheme
+│       └── modelslim_w8a8_int8_moe.py  # W8A8 MoE scheme
+├── compressed_tensors/             # Compressed Tensors format
+├── fp8.py                          # FP8 quantization
+├── awq.py                          # AWQ quantization
+└── gptq.py                         # GPTQ quantization
 
 python/sglang/srt/hardware_backend/npu/quantization/
-├── linear_method_npu.py            # NPU 线性层量化方法
-└── fused_moe_method_npu.py         # NPU MoE 量化方法
+├── linear_method_npu.py            # NPU linear layer quantization method
+└── fused_moe_method_npu.py         # NPU MoE quantization method
 ```
 
-## 支持的量化类型
+## Supported Quantization Types
 
-### NPU 专用量化
+### NPU-Specific Quantization
 
-| 类型 | 权重位宽 | 激活位宽 | 适用场景 |
-|------|----------|----------|----------|
-| W8A8 (Static) | INT8 | INT8 | 静态量化，需要校准 |
-| W8A8 (Dynamic) | INT8 | INT8 (动态) | 动态量化，无需校准 |
-| W4A4 (Dynamic) | INT4 | INT4 (动态) | 极致压缩 |
-| W4A8 MoE | INT4 | INT8 (动态) | MoE 模型 |
-| W8A8 MoE | INT8 | INT8 (动态) | MoE 模型 |
+| Type | Weight Bit-width | Activation Bit-width | Use Case |
+|------|------------------|----------------------|----------|
+| W8A8 (Static) | INT8 | INT8 | Static quantization, requires calibration |
+| W8A8 (Dynamic) | INT8 | INT8 (dynamic) | Dynamic quantization, no calibration needed |
+| W4A4 (Dynamic) | INT4 | INT4 (dynamic) | Extreme compression |
+| W4A8 MoE | INT4 | INT8 (dynamic) | MoE models |
+| W8A8 MoE | INT8 | INT8 (dynamic) | MoE models |
 
-### 通用量化 (NPU 部分支持)
+### General Quantization (Partial NPU Support)
 
-| 类型 | 说明 | NPU 支持 |
-|------|------|----------|
-| FP8 | 8-bit 浮点 | ⚠️ 有限支持 |
-| AWQ | Activation-aware | ⚠️ 有限支持 |
-| GPTQ | Post-training | ⚠️ 有限支持 |
-| GGUF | llama.cpp 格式 | ❌ 不支持 |
+| Type | Description | NPU Support |
+|------|-------------|-------------|
+| FP8 | 8-bit floating point | ⚠️ Limited support |
+| AWQ | Activation-aware | ⚠️ Limited support |
+| GPTQ | Post-training | ⚠️ Limited support |
+| GGUF | llama.cpp format | ❌ Not supported |
 
-## ModelSlim 量化
+## ModelSlim Quantization
 
-### 概述
+### Overview
 
-ModelSlim 是华为提供的模型量化工具，SGLang 支持加载 ModelSlim 量化后的模型。
+ModelSlim is a model quantization tool provided by Huawei. SGLang supports loading ModelSlim-quantized models.
 
-### 配置文件
+### Configuration File
 
-ModelSlim 量化模型需要 `quant_model_description.json` 文件：
+ModelSlim quantized models require a `quant_model_description.json` file:
 
 ```json
 {
@@ -74,16 +74,16 @@ ModelSlim 量化模型需要 `quant_model_description.json` 文件：
 }
 ```
 
-### 量化类型说明
+### Quantization Type Descriptions
 
-| 标识 | 类型 | 说明 |
-|------|------|------|
-| `W8A8` | 静态 W8A8 | 需要输入 scale/offset |
-| `W8A8_DYNAMIC` | 动态 W8A8 | 运行时计算激活 scale |
-| `W4A4_DYNAMIC` | 动态 W4A4 | 运行时计算激活 scale |
-| `FLOAT` | 不量化 | 保持浮点精度 |
+| Identifier | Type | Description |
+|------------|------|-------------|
+| `W8A8` | Static W8A8 | Requires input scale/offset |
+| `W8A8_DYNAMIC` | Dynamic W8A8 | Computes activation scale at runtime |
+| `W4A4_DYNAMIC` | Dynamic W4A4 | Computes activation scale at runtime |
+| `FLOAT` | Not quantized | Maintains floating-point precision |
 
-### 启动命令
+### Launch Command
 
 ```bash
 python -m sglang.launch_server \
@@ -93,35 +93,35 @@ python -m sglang.launch_server \
     --device npu
 ```
 
-## W8A8 INT8 量化详解
+## W8A8 INT8 Quantization Details
 
-### 静态量化 (W8A8)
+### Static Quantization (W8A8)
 
-**权重处理**:
+**Weight Processing**:
 
 ```python
-# 在 linear_method_npu.py 中
+# In linear_method_npu.py
 def process_weights_after_loading(self, layer: torch.nn.Module):
-    # 转置并转换为 NPU 格式
+    # Transpose and convert to NPU format
     layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
     layer.weight.data = npu_format_cast(layer.weight.data)
     
-    # 展开 scale 和 offset
+    # Flatten scale and offset
     layer.weight_scale.data = layer.weight_scale.data.flatten()
     layer.weight_offset.data = layer.weight_offset.data.flatten()
     
-    # 扩展输入 scale/offset
+    # Expand input scale/offset
     expanding_factor = layer.weight.data.shape[0]
     layer.aclnn_input_scale = layer.input_scale.data.repeat(expanding_factor)
     layer.aclnn_input_scale_reciprocal = 1 / layer.aclnn_input_scale
     layer.aclnn_input_offset = layer.input_offset.data.repeat(expanding_factor)
 ```
 
-**前向计算**:
+**Forward Computation**:
 
 ```python
 def apply(self, layer, x, bias=None):
-    # 1. 量化输入
+    # 1. Quantize input
     x = torch.ops.npu.npu_quantize(
         x,
         layer.aclnn_input_scale_reciprocal,
@@ -131,7 +131,7 @@ def apply(self, layer, x, bias=None):
         False,
     )
     
-    # 2. 量化矩阵乘
+    # 2. Quantized matmul
     return torch.ops.npu.npu_quant_matmul(
         x,
         layer.weight,
@@ -141,18 +141,18 @@ def apply(self, layer, x, bias=None):
     )
 ```
 
-### 动态量化 (W8A8_DYNAMIC)
+### Dynamic Quantization (W8A8_DYNAMIC)
 
-**特点**: 运行时动态计算激活的 scale，无需预先校准。
+**Feature**: Dynamically computes activation scale at runtime, no pre-calibration required.
 
-**前向计算**:
+**Forward Computation**:
 
 ```python
 def apply(self, layer, x, bias=None):
-    # 1. 动态量化 (运行时计算 scale)
+    # 1. Dynamic quantization (compute scale at runtime)
     quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
     
-    # 2. 量化矩阵乘
+    # 2. Quantized matmul
     return torch.ops.npu.npu_quant_matmul(
         quant_out,
         layer.weight,
@@ -163,9 +163,9 @@ def apply(self, layer, x, bias=None):
     )
 ```
 
-## W4A4 INT4 量化详解
+## W4A4 INT4 Quantization Details
 
-**权重处理**:
+**Weight Processing**:
 
 ```python
 def process_weights_after_loading(self, layer):
@@ -173,17 +173,17 @@ def process_weights_after_loading(self, layer):
     layer.weight_scale.data = layer.weight_scale.data.flatten()
     layer.weight_offset.data = layer.weight_offset.data.flatten()
     
-    # 转换为 INT4 packed 格式
+    # Convert to INT4 packed format
     layer.weight.data = torch.ops.npu.npu_convert_weight_to_int4pack(
         layer.weight.data.to(torch.int32)
     )
 ```
 
-**前向计算**:
+**Forward Computation**:
 
 ```python
 def apply(self, layer, x, bias=None):
-    # 动态量化为 INT4
+    # Dynamic quantization to INT4
     quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
         x, dst_type=torch.quint4x2
     )
@@ -198,26 +198,26 @@ def apply(self, layer, x, bias=None):
     )
 ```
 
-## MoE 量化
+## MoE Quantization
 
 ### W8A8 MoE
 
-**前向计算**:
+**Forward Computation**:
 
 ```python
 def npu_fused_experts(hidden_states, w13, w13_scale, w2, w2_scale, topk_weights, topk_ids, top_k):
-    # 1. MoE 路由初始化
+    # 1. MoE routing initialization
     hidden_states, expanded_row_idx, expanded_expert_idx = \
         torch.ops.npu.npu_moe_init_routing(
             hidden_states, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
         )
     
-    # 2. 计算 expert tokens
+    # 2. Compute expert tokens
     expert_tokens = torch.ops.npu.npu_moe_compute_expert_tokens(
         expanded_expert_idx, num_experts
     )
     
-    # 3. gate_up_proj (动态量化)
+    # 3. gate_up_proj (dynamic quantization)
     hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
@@ -228,7 +228,7 @@ def npu_fused_experts(hidden_states, w13, w13_scale, w2, w2_scale, topk_weights,
         output_dtype=original_dtype,
     )[0]
     
-    # 4. swiglu 激活
+    # 4. swiglu activation
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     
     # 5. down_proj
@@ -247,19 +247,19 @@ def npu_fused_experts(hidden_states, w13, w13_scale, w2, w2_scale, topk_weights,
 
 ### W4A8 MoE
 
-与 W8A8 MoE 类似，但权重为 INT4 格式。
+Similar to W8A8 MoE, but weights are in INT4 format.
 
-## RMSNorm 量化适配
+## RMSNorm Quantization Adaptation
 
-W8A8 量化需要修改 RMSNorm 以添加 bias：
+W8A8 quantization requires modifying RMSNorm to add bias:
 
 ```python
-# 在 modelslim.py 中
+# In modelslim.py
 def npu_wrapper_rmsnorm_init(func):
     def init(self, hidden_size, **extra_args):
         func(self, hidden_size, **extra_args)
         self.ignore_anti = True
-        # 添加 bias 用于量化
+        # Add bias for quantization
         self.bias = torch.nn.Parameter(torch.zeros(hidden_size), requires_grad=False)
     return init
 
@@ -279,52 +279,52 @@ def npu_wrapper_rmsnorm_forward(func):
     return _rmsnorm_forward_oot
 ```
 
-## 关键 NPU 算子
+## Key NPU Operators
 
 ### npu_quantize
 
-**用途**: 将浮点 tensor 量化为整数
+**Purpose**: Quantize floating-point tensor to integer
 
 ```python
 torch.ops.npu.npu_quantize(
-    x,                    # 输入 tensor
-    scale,                # 量化 scale
-    offset,               # 量化 offset
-    dst_type,             # 目标类型 (torch.qint8, torch.quint4x2)
-    axis,                 # 量化轴
-    squeeze,              # 是否压缩
+    x,                    # Input tensor
+    scale,                # Quantization scale
+    offset,               # Quantization offset
+    dst_type,             # Target type (torch.qint8, torch.quint4x2)
+    axis,                 # Quantization axis
+    squeeze,              # Whether to squeeze
 )
 ```
 
 ### npu_dynamic_quant
 
-**用途**: 动态量化，返回量化结果和 scale
+**Purpose**: Dynamic quantization, returns quantized result and scale
 
 ```python
 quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
-    x,                    # 输入 tensor
-    dst_type=torch.qint8  # 目标类型
+    x,                    # Input tensor
+    dst_type=torch.qint8  # Target type
 )
 ```
 
 ### npu_quant_matmul
 
-**用途**: 量化矩阵乘法
+**Purpose**: Quantized matrix multiplication
 
 ```python
 torch.ops.npu.npu_quant_matmul(
-    x,                    # 量化输入
-    weight,               # 量化权重
-    scale,                # 反量化 scale
-    pertoken_scale=None,  # 动态 scale (可选)
-    bias=None,            # 偏置
+    x,                    # Quantized input
+    weight,               # Quantized weight
+    scale,                # Dequantization scale
+    pertoken_scale=None,  # Dynamic scale (optional)
+    bias=None,            # Bias
     output_dtype=torch.float16,
 )
 ```
 
 ### npu_grouped_matmul
 
-**用途**: 分组矩阵乘法 (MoE)
+**Purpose**: Grouped matrix multiplication (MoE)
 
 ```python
 torch.ops.npu.npu_grouped_matmul(
@@ -342,16 +342,16 @@ torch.ops.npu.npu_grouped_matmul(
 
 ### npu_format_cast
 
-**用途**: 转换为 NPU 优化格式
+**Purpose**: Convert to NPU-optimized format
 
 ```python
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
-weight = npu_format_cast(weight)  # 转换为 NZ 格式
+weight = npu_format_cast(weight)  # Convert to NZ format
 ```
 
-## 配置示例
+## Configuration Examples
 
-### DeepSeek-V3 量化模型
+### DeepSeek-V3 Quantized Model
 
 ```bash
 export ASCEND_USE_FIA=1
@@ -367,7 +367,7 @@ python -m sglang.launch_server \
     --device npu
 ```
 
-### Qwen2.5 MoE 量化模型
+### Qwen2.5 MoE Quantized Model
 
 ```bash
 python -m sglang.launch_server \
@@ -380,77 +380,77 @@ python -m sglang.launch_server \
     --device npu
 ```
 
-## 常见问题排查
+## Common Issue Troubleshooting
 
-### 1. 量化配置文件未找到
+### 1. Quantization Configuration File Not Found
 
-**症状**: `FileNotFoundError: quant_model_description.json`
+**Symptom**: `FileNotFoundError: quant_model_description.json`
 
-**解决方案**:
-- 确认模型目录包含 `quant_model_description.json`
-- 检查 `--quantization modelslim` 参数
+**Solution**:
+- Confirm model directory contains `quant_model_description.json`
+- Check `--quantization modelslim` parameter
 
-### 2. 权重维度不匹配
+### 2. Weight Dimension Mismatch
 
-**症状**: `RuntimeError: shape mismatch in npu_quant_matmul`
+**Symptom**: `RuntimeError: shape mismatch in npu_quant_matmul`
 
-**检查点**:
-- 权重是否正确转置
-- `npu_format_cast` 是否正确应用
-- 检查 `weight_scale` 和 `weight_offset` 维度
+**Checkpoints**:
+- Is weight correctly transposed
+- Is `npu_format_cast` correctly applied
+- Check `weight_scale` and `weight_offset` dimensions
 
-### 3. 精度下降严重
+### 3. Significant Accuracy Degradation
 
-**症状**: 模型输出质量明显下降
+**Symptom**: Model output quality significantly degraded
 
-**检查点**:
-- 确认量化配置与模型匹配
-- 检查 `ignore` 列表是否正确
-- 验证 `FLOAT` 层是否被正确跳过
+**Checkpoints**:
+- Confirm quantization configuration matches model
+- Check if `ignore` list is correct
+- Verify `FLOAT` layers are correctly skipped
 
-### 4. 动态量化性能问题
+### 4. Dynamic Quantization Performance Issues
 
-**症状**: 动态量化比静态量化慢
+**Symptom**: Dynamic quantization slower than static quantization
 
-**原因**: 动态量化需要运行时计算 scale
+**Reason**: Dynamic quantization requires computing scale at runtime
 
-**建议**:
-- 对于稳定输入分布，使用静态量化
-- 对于变化输入分布，使用动态量化
+**Recommendations**:
+- For stable input distributions, use static quantization
+- For variable input distributions, use dynamic quantization
 
-### 5. MoE 量化错误
+### 5. MoE Quantization Errors
 
-**症状**: `RuntimeError in npu_grouped_matmul`
+**Symptom**: `RuntimeError in npu_grouped_matmul`
 
-**检查点**:
-- `expert_tokens` 是否正确计算
-- 权重格式是否正确
-- 检查 `group_list` 参数
+**Checkpoints**:
+- Is `expert_tokens` correctly computed
+- Is weight format correct
+- Check `group_list` parameter
 
-## 性能对比
+## Performance Comparison
 
-| 量化类型 | 内存占用 | 推理速度 | 精度损失 |
-|----------|----------|----------|----------|
-| FP16/BF16 | 100% | 基准 | 无 |
-| W8A8 Static | ~50% | 1.5-2x | 小 |
-| W8A8 Dynamic | ~50% | 1.3-1.8x | 小 |
-| W4A4 Dynamic | ~25% | 1.2-1.5x | 中等 |
+| Quantization Type | Memory Usage | Inference Speed | Accuracy Loss |
+|-------------------|--------------|-----------------|---------------|
+| FP16/BF16 | 100% | Baseline | None |
+| W8A8 Static | ~50% | 1.5-2x | Small |
+| W8A8 Dynamic | ~50% | 1.3-1.8x | Small |
+| W4A4 Dynamic | ~25% | 1.2-1.5x | Moderate |
 
-## 与其他模块的关系
+## Relationship with Other Modules
 
 ```
 Quantization
-├── 配置加载: ModelSlimConfig.from_config()
-├── 权重创建: ModelSlimLinearMethod.create_weights()
-├── 权重处理: process_weights_after_loading()
-├── 前向计算: apply() → npu_quant_matmul()
+├── Configuration Loading: ModelSlimConfig.from_config()
+├── Weight Creation: ModelSlimLinearMethod.create_weights()
+├── Weight Processing: process_weights_after_loading()
+├── Forward Computation: apply() → npu_quant_matmul()
 ├── MoE: npu_fused_experts()
 └── RMSNorm: npu_rms_norm + bias
 ```
 
-## 调试建议
+## Debugging Suggestions
 
-### 1. 检查量化配置
+### 1. Check Quantization Configuration
 
 ```python
 import json
@@ -459,19 +459,19 @@ with open("/models/quantized-model/quant_model_description.json") as f:
 print(json.dumps(config, indent=2))
 ```
 
-### 2. 验证权重格式
+### 2. Verify Weight Format
 
 ```python
-# 在 process_weights_after_loading 中添加
+# Add in process_weights_after_loading
 print(f"Weight shape: {layer.weight.shape}")
 print(f"Weight dtype: {layer.weight.dtype}")
 print(f"Weight scale shape: {layer.weight_scale.shape}")
 ```
 
-### 3. 检查量化精度
+### 3. Check Quantization Accuracy
 
 ```python
-# 对比量化前后输出
+# Compare output before and after quantization
 with torch.no_grad():
     output_fp16 = model_fp16(input_ids)
     output_quant = model_quant(input_ids)

@@ -1,65 +1,65 @@
 # NPU MLA Preprocess Reference
 
-## 概述
+## Overview
 
-MLA (Multi-head Latent Attention) 预处理模块是 DeepSeek-V2/V3 等 MLA 架构模型在 NPU 上运行的关键组件。它负责将压缩的 latent representation 转换为可计算的形式。
+The MLA (Multi-head Latent Attention) preprocessing module is a key component for MLA architecture models like DeepSeek-V2/V3 running on NPU. It is responsible for transforming compressed latent representations into computable forms.
 
-## 核心文件
+## Core Files
 
 ```
 python/sglang/srt/hardware_backend/npu/attention/mla_preprocess.py
 ```
 
-## 环境变量
+## Environment Variables
 
-| 变量名 | 说明 | 默认值 |
-|--------|------|--------|
-| `SGLANG_NPU_USE_MLAPO` | 启用 MLAPO 优化 | False |
-| `SGLANG_USE_FIA_NZ` | 启用 NZ 格式 (需配合 MLAPO) | False |
+| Variable Name | Description | Default |
+|---------------|-------------|---------|
+| `SGLANG_NPU_USE_MLAPO` | Enable MLAPO optimization | False |
+| `SGLANG_USE_FIA_NZ` | Enable NZ format (requires MLAPO) | False |
 
-## NPUFusedMLAPreprocess 类
+## NPUFusedMLAPreprocess Class
 
-### 初始化参数
+### Initialization Parameters
 
 ```python
 NPUFusedMLAPreprocess(
-    fused_qkv_a_proj_with_mqa,  # 融合的 QKV 投影层
-    q_a_layernorm,              # Q 的 LayerNorm
-    kv_a_layernorm,             # KV 的 LayerNorm
-    q_b_proj,                   # Q 的第二投影层
-    w_kc,                       # Key 压缩权重
-    rotary_emb,                 # 旋转位置编码
-    layer_id,                   # 层 ID
-    num_local_heads,            # 本地头数 (TP 后)
-    qk_nope_head_dim,           # 非 RoPE 维度 (如 128)
-    qk_rope_head_dim,           # RoPE 维度 (如 64)
-    v_head_dim,                 # Value 维度
-    quant_config,               # 量化配置
+    fused_qkv_a_proj_with_mqa,  # Fused QKV projection layer
+    q_a_layernorm,              # Q LayerNorm
+    kv_a_layernorm,             # KV LayerNorm
+    q_b_proj,                   # Q second projection layer
+    w_kc,                       # Key compression weight
+    rotary_emb,                 # Rotary position encoding
+    layer_id,                   # Layer ID
+    num_local_heads,            # Local head count (after TP)
+    qk_nope_head_dim,           # Non-RoPE dimension (e.g., 128)
+    qk_rope_head_dim,           # RoPE dimension (e.g., 64)
+    v_head_dim,                 # Value dimension
+    quant_config,               # Quantization configuration
 )
 ```
 
-### 关键维度说明
+### Key Dimension Specifications
 
-| 维度 | DeepSeek-V2/V3 典型值 | 说明 |
-|------|----------------------|------|
-| `q_lora_rank` | 1536 | Q 的 LoRA 压缩秩 |
-| `kv_lora_rank` | 512 | KV 的 LoRA 压缩秩 |
-| `qk_nope_head_dim` | 128 | Query/Key 非 RoPE 部分 |
-| `qk_rope_head_dim` | 64 | Query/Key RoPE 部分 |
+| Dimension | DeepSeek-V2/V3 Typical Value | Description |
+|-----------|------------------------------|-------------|
+| `q_lora_rank` | 1536 | Q LoRA compression rank |
+| `kv_lora_rank` | 512 | KV LoRA compression rank |
+| `qk_nope_head_dim` | 128 | Query/Key non-RoPE part |
+| `qk_rope_head_dim` | 64 | Query/Key RoPE part |
 | `qk_head_dim` | 192 | qk_nope + qk_rope |
-| `v_head_dim` | 128 | Value 头维度 |
+| `v_head_dim` | 128 | Value head dimension |
 
-### 三种预处理模式
+### Three Preprocessing Modes
 
-#### 1. forward_mlapo (W8A8 量化模式)
+#### 1. forward_mlapo (W8A8 Quantization Mode)
 
-**触发条件**: `qkv_a_proj` 使用 modelslim 量化
+**Trigger Condition**: `qkv_a_proj` uses modelslim quantization
 
-**流程**:
+**Flow**:
 ```
 hidden_states
     ↓
-qkv_a_proj (量化矩阵乘)
+qkv_a_proj (quantized matmul)
     ↓
 split → q_lowrank, latent_cache
     ↓
@@ -74,18 +74,18 @@ npu_interleave_rope(q_pe) → q_rope_out
 npu_kv_rmsnorm_rope_cache(latent_cache) → k_rope, k_nope
 ```
 
-**关键算子**: `torch.ops.npu.mla_preprocess`
+**Key Operator**: `torch.ops.npu.mla_preprocess`
 
-**权重预处理** (`preprocess_weights` 方法):
-- 将权重转换为 NZ 格式
-- 重新排列 RoPE 维度 (`trans_rope_weight`)
-- 准备 dequant_scale 和 quant_bias
+**Weight Preprocessing** (`preprocess_weights` method):
+- Convert weights to NZ format
+- Rearrange RoPE dimensions (`trans_rope_weight`)
+- Prepare dequant_scale and quant_bias
 
-#### 2. forward_mlaprolog (MLA Prolog 模式)
+#### 2. forward_mlaprolog (MLA Prolog Mode)
 
-**触发条件**: `quant_config.ignore` 包含 `kv_b_proj`
+**Trigger Condition**: `quant_config.ignore` contains `kv_b_proj`
 
-**流程**:
+**Flow**:
 ```
 hidden_states
     ↓
@@ -100,13 +100,13 @@ npu_mla_prolog_v3(
 q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm
 ```
 
-**特点**: 使用 CANN 的 MLA Prolog 算子，更高效
+**Feature**: Uses CANN's MLA Prolog operator, more efficient
 
-#### 3. forward_absorb_prepare_npu_rms_norm_cache (非量化模式)
+#### 3. forward_absorb_prepare_npu_rms_norm_cache (Non-quantized Mode)
 
-**触发条件**: 非量化模型
+**Trigger Condition**: Non-quantized model
 
-**流程**:
+**Flow**:
 ```
 hidden_states
     ↓
@@ -123,33 +123,33 @@ rotary_emb(q_pe, k_pe) → q_pe, k_pe
 npu_kv_rmsnorm_rope_cache → k_rope, k_nope
 ```
 
-## 权重变换详解
+## Weight Transformation Details
 
-### trans_rope_weight 函数
+### trans_rope_weight Function
 
-**用途**: 重新排列 RoPE 维度以适应 NPU 算子
+**Purpose**: Rearrange RoPE dimensions to adapt to NPU operators
 
 ```python
 def trans_rope_weight(weight, rope_dim):
-    # 将 RoPE 维度的奇偶位置重新排列
-    weight_1 = weight[..., -rope_dim::2, :]  # 偶数位置
-    weight_2 = weight[..., -rope_dim + 1 :: 2, :]  # 奇数位置
+    # Rearrange odd and even positions of RoPE dimension
+    weight_1 = weight[..., -rope_dim::2, :]  # Even positions
+    weight_2 = weight[..., -rope_dim + 1 :: 2, :]  # Odd positions
     weight[..., -rope_dim:, :] = torch.cat([weight_1, weight_2], dim=-2)
     return weight
 ```
 
-### transdata 函数
+### transdata Function
 
-**用途**: 将矩阵转换为 NZ (Block Major) 格式
+**Purpose**: Convert matrix to NZ (Block Major) format
 
 ```python
 def transdata(nd_mat, block_size=(16, 16)):
-    # 将矩阵分块并重排为 NPU 优化的格式
-    # 输入: [M, N]
-    # 输出: [N//16, M*16, 16] (NZ 格式)
+    # Block and rearrange matrix to NPU-optimized format
+    # Input: [M, N]
+    # Output: [N//16, M*16, 16] (NZ format)
 ```
 
-## KV Cache 操作
+## KV Cache Operations
 
 ### get_kv_cache_and_cache_idx
 
@@ -160,37 +160,37 @@ def get_kv_cache_and_cache_idx(self, forward_batch):
     return k_cache, v_cache, slot_mapping
 ```
 
-**注意**: MLA 模型中:
-- `k_cache` 存储 `kv_c` (压缩的 KV latent)
-- `v_cache` 存储 `k_pe` (Key 的 RoPE 部分)
+**Note**: In MLA models:
+- `k_cache` stores `kv_c` (compressed KV latent)
+- `v_cache` stores `k_pe` (Key RoPE part)
 
-### Cache 模式
+### Cache Modes
 
-| 模式 | 说明 | 触发条件 |
-|------|------|----------|
-| `PA_BNSD` | 标准 Paged Attention 布局 | 默认 |
-| `PA_NZ` | NZ 格式 | `SGLANG_USE_FIA_NZ=1` |
-| `krope_ctkv` | K RoPE + CTKV | MLAPO 模式 |
-| `nzcache` | NZ Cache | FIA NZ 模式 |
+| Mode | Description | Trigger Condition |
+|------|-------------|-------------------|
+| `PA_BNSD` | Standard Paged Attention layout | Default |
+| `PA_NZ` | NZ format | `SGLANG_USE_FIA_NZ=1` |
+| `krope_ctkv` | K RoPE + CTKV | MLAPO mode |
+| `nzcache` | NZ Cache | FIA NZ mode |
 
-## 与 Attention Backend 的交互
+## Interaction with Attention Backend
 
-### 数据流
+### Data Flow
 
 ```
 NPUFusedMLAPreprocess.forward()
     ↓
 (q_rope, k_rope, q_nope, k_nope, ...)
     ↓
-AscendAttnBackend.forward_mla() 或 forward_sparse()
+AscendAttnBackend.forward_mla() or forward_sparse()
     ↓
-npu_fused_infer_attention_score 或 npu_ring_mla
+npu_fused_infer_attention_score or npu_ring_mla
 ```
 
-### 关键接口
+### Key Interfaces
 
 ```python
-# 在 deepseek_v2_attention_mla_npu.py 中
+# In deepseek_v2_attention_mla_npu.py
 def forward_mla_prepare_npu(m, positions, hidden_states, forward_batch, ...):
     if is_mla_preprocess_enabled():
         if not hasattr(m, "mla_preprocess"):
@@ -198,47 +198,47 @@ def forward_mla_prepare_npu(m, positions, hidden_states, forward_batch, ...):
         (q_pe, k_pe, q_nope_out, k_nope, ...) = m.mla_preprocess.forward(...)
 ```
 
-## 常见问题排查
+## Common Issue Troubleshooting
 
-### 1. 维度错误
+### 1. Dimension Errors
 
-**症状**: `RuntimeError: shape mismatch`
+**Symptom**: `RuntimeError: shape mismatch`
 
-**检查点**:
-- `kv_lora_rank` 是否与模型配置一致
-- `qk_rope_head_dim` 是否正确
-- `num_local_heads` 是否考虑了 TP 分片
+**Checkpoints**:
+- Is `kv_lora_rank` consistent with model configuration
+- Is `qk_rope_head_dim` correct
+- Does `num_local_heads` account for TP sharding
 
-### 2. 量化相关问题
+### 2. Quantization-related Issues
 
-**症状**: 精度下降或 NaN
+**Symptom**: Accuracy degradation or NaN
 
-**检查点**:
-- `deq_scale` 和 `quant_bias` 是否正确加载
-- 权重是否正确转换为 NZ 格式
-- 检查 `input_scale` 和 `input_offset`
+**Checkpoints**:
+- Are `deq_scale` and `quant_bias` correctly loaded
+- Are weights correctly converted to NZ format
+- Check `input_scale` and `input_offset`
 
-### 3. Cache 格式问题
+### 3. Cache Format Issues
 
-**症状**: FIA 算子报错
+**Symptom**: FIA operator errors
 
-**检查点**:
-- `SGLANG_USE_FIA_NZ` 是否与实际 cache 格式匹配
-- `cache_mode` 参数是否正确
-- `slot_mapping` 类型是否为 `int32` 或 `int64`
+**Checkpoints**:
+- Does `SGLANG_USE_FIA_NZ` match actual cache format
+- Is `cache_mode` parameter correct
+- Is `slot_mapping` type `int32` or `int64`
 
-### 4. RoPE 相关问题
+### 4. RoPE-related Issues
 
-**症状**: 位置编码错误
+**Symptom**: Position encoding errors
 
-**检查点**:
-- `cos` 和 `sin` 是否正确计算
-- `npu_interleave_rope` vs `rotary_emb` 的选择
-- 检查 `positions` tensor 是否正确
+**Checkpoints**:
+- Are `cos` and `sin` correctly calculated
+- Choice of `npu_interleave_rope` vs `rotary_emb`
+- Check if `positions` tensor is correct
 
-## 调试建议
+## Debugging Suggestions
 
-1. **添加日志**: 在 `forward` 方法开始处打印 tensor shapes
-2. **检查权重**: 确保 `preprocess_weights` 只执行一次
-3. **验证 cache**: 检查 `slot_mapping` 的值是否在有效范围内
-4. **对比路径**: 对于同一模型，对比三种模式的输出
+1. **Add Logging**: Print tensor shapes at the beginning of `forward` method
+2. **Check Weights**: Ensure `preprocess_weights` executes only once
+3. **Verify Cache**: Check if `slot_mapping` values are within valid range
+4. **Compare Paths**: For the same model, compare outputs of three modes

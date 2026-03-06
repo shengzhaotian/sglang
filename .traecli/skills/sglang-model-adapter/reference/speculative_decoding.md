@@ -1,73 +1,73 @@
 # NPU Speculative Decoding Reference
 
-## 概述
+## Overview
 
-投机解码 (Speculative Decoding) 是一种加速 LLM 推理的技术，通过使用小型 draft 模型预测多个 token，然后由 target 模型验证，从而减少解码延迟。本文档介绍 NPU 上的投机解码实现。
+Speculative Decoding is a technique to accelerate LLM inference by using a small draft model to predict multiple tokens, which are then verified by the target model, reducing decoding latency. This document introduces speculative decoding implementation on NPU.
 
-## 核心文件
+## Core Files
 
 ```
 python/sglang/srt/speculative/
-├── spec_info.py                   # 投机算法定义
-├── spec_utils.py                  # 工具函数
-├── eagle_worker.py                # EAGLE Worker (非重叠)
-├── eagle_worker_v2.py             # EAGLE Worker V2 (重叠)
-├── eagle_info.py                  # EAGLE 输入/输出定义
-├── eagle_info_v2.py               # EAGLE V2 输入/输出定义
-├── eagle_utils.py                 # EAGLE 工具函数
+├── spec_info.py                   # Speculative algorithm definitions
+├── spec_utils.py                  # Utility functions
+├── eagle_worker.py                # EAGLE Worker (non-overlapping)
+├── eagle_worker_v2.py             # EAGLE Worker V2 (overlapping)
+├── eagle_info.py                  # EAGLE input/output definitions
+├── eagle_info_v2.py               # EAGLE V2 input/output definitions
+├── eagle_utils.py                 # EAGLE utility functions
 ├── standalone_worker.py           # Standalone Worker
 ├── ngram_worker.py                # NGRAM Worker
-├── multi_layer_eagle_worker.py    # 多层 EAGLE Worker
-└── draft_utils.py                 # Draft 工具
+├── multi_layer_eagle_worker.py    # Multi-layer EAGLE Worker
+└── draft_utils.py                 # Draft utilities
 
 python/sglang/srt/hardware_backend/npu/graph_runner/
 ├── eagle_draft_npu_graph_runner.py      # NPU EAGLE Draft Graph
 └── eagle_draft_extend_npu_graph_runner.py  # NPU EAGLE Extend Graph
 ```
 
-## 投机算法类型
+## Speculative Algorithm Types
 
-### SpeculativeAlgorithm 枚举
+### SpeculativeAlgorithm Enum
 
 ```python
 class SpeculativeAlgorithm(Enum):
-    EAGLE = auto()       # EAGLE 算法
-    EAGLE3 = auto()      # EAGLE3 算法 (改进版)
-    STANDALONE = auto()  # 独立 Draft 模型
-    NGRAM = auto()       # NGRAM 自回归
-    NONE = auto()        # 无投机解码
+    EAGLE = auto()       # EAGLE algorithm
+    EAGLE3 = auto()      # EAGLE3 algorithm (improved)
+    STANDALONE = auto()  # Independent draft model
+    NGRAM = auto()       # NGRAM autoregressive
+    NONE = auto()        # No speculative decoding
 ```
 
-### 算法对比
+### Algorithm Comparison
 
-| 算法 | Draft 模型 | 特点 | 适用场景 |
-|------|-----------|------|----------|
-| EAGLE | 轻量级扩展 | 与 Target 共享权重 | EAGLE 训练过的模型 |
-| EAGLE3 | 改进版 EAGLE | 更高接受率 | EAGLE3 训练过的模型 |
-| STANDALONE | 独立小模型 | 灵活选择 | 通用场景 |
-| NGRAM | 无需模型 | 零额外开销 | 简单场景 |
+| Algorithm | Draft Model | Features | Use Case |
+|-----------|-------------|----------|----------|
+| EAGLE | Lightweight extension | Shares weights with Target | EAGLE-trained models |
+| EAGLE3 | Improved EAGLE | Higher acceptance rate | EAGLE3-trained models |
+| STANDALONE | Independent small model | Flexible selection | General scenarios |
+| NGRAM | No model needed | Zero extra overhead | Simple scenarios |
 
-## EAGLE 投机解码
+## EAGLE Speculative Decoding
 
-### 工作原理
+### How It Works
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    EAGLE 投机解码流程                     │
-├─────────────────────────────────────────────────────────┤
-│  1. Draft 阶段:                                         │
-│     Input → Draft Model → 生成 N 个候选 token          │
-│                                                         │
-│  2. Verify 阶段:                                        │
-│     候选 token → Target Model → 并行验证               │
-│                                                         │
-│  3. 接受/拒绝:                                          │
-│     根据概率决定接受哪些 token                          │
-│     接受的 token 加入输出序列                           │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                    EAGLE Speculative Decoding Flow              │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Draft Phase:                                                │
+│     Input → Draft Model → Generate N candidate tokens           │
+│                                                                 │
+│  2. Verify Phase:                                               │
+│     Candidate tokens → Target Model → Parallel verification     │
+│                                                                 │
+│  3. Accept/Reject:                                              │
+│     Decide which tokens to accept based on probability          │
+│     Accepted tokens added to output sequence                    │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### EAGLE Worker 结构
+### EAGLE Worker Structure
 
 ```python
 class EagleDraftWorker(BaseDraftWorker):
@@ -76,10 +76,10 @@ class EagleDraftWorker(BaseDraftWorker):
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         
-        # Draft worker 使用共享的内存池
+        # Draft worker uses shared memory pool
         self.req_to_token_pool = target_worker.get_memory_pool()
         
-        # 初始化 draft model
+        # Initialize draft model
         self.draft_worker = TpModelWorker(
             server_args=server_args,
             is_draft_worker=True,
@@ -87,33 +87,33 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 ```
 
-### 关键参数
+### Key Parameters
 
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `--speculative-algorithm` | 投机算法 | None |
-| `--speculative-draft-model-path` | Draft 模型路径 | None |
-| `--speculative-num-steps` | Draft 步数 | 5 |
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--speculative-algorithm` | Speculative algorithm | None |
+| `--speculative-draft-model-path` | Draft model path | None |
+| `--speculative-num-steps` | Draft steps | 5 |
 | `--speculative-eagle-topk` | EAGLE top-k | 8 |
-| `--speculative-num-draft-tokens` | Draft token 数 | 64 |
-| `--speculative-accept-threshold-single` | 单 token 接受阈值 | 1.0 |
-| `--speculative-accept-threshold-acc` | 累积接受阈值 | 1.0 |
+| `--speculative-num-draft-tokens` | Draft token count | 64 |
+| `--speculative-accept-threshold-single` | Single token accept threshold | 1.0 |
+| `--speculative-accept-threshold-acc` | Cumulative accept threshold | 1.0 |
 
-### NPU 特殊实现
+### NPU-Specific Implementation
 
 #### Graph Runner
 
 ```python
-# 在 eagle_draft_npu_graph_runner.py 中
+# In eagle_draft_npu_graph_runner.py
 class EAGLEDraftNpuGraphRunner:
-    """NPU 上的 EAGLE Draft Graph Runner"""
+    """NPU EAGLE Draft Graph Runner"""
     
     def __init__(self, ...):
-        # 初始化 NPU graph
+        # Initialize NPU graph
         self.graph = torch.npu.CUDAGraph()
         
     def capture(self, ...):
-        # 捕获 NPU graph
+        # Capture NPU graph
         with torch.npu.graph(self.graph):
             output = self.model(...)
 ```
@@ -121,16 +121,16 @@ class EAGLEDraftNpuGraphRunner:
 #### Attention Backend
 
 ```python
-# 在 ascend_backend.py 中
+# In ascend_backend.py
 def forward_mtp(self, q, k, v, layer, forward_batch, ...):
-    """处理 MTP (Multi-Token Prediction) 推测解码"""
+    """Handle MTP (Multi-Token Prediction) speculative decoding"""
     
     if self.use_mla:
-        # MLA 模型的 MTP 处理
+        # MTP handling for MLA models
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
         
-        # 使用 FIA 进行批量 attention
+        # Use FIA for batched attention
         attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
             query, k_cache, v_cache,
             block_table=self.forward_metadata.block_tables,
@@ -138,9 +138,9 @@ def forward_mtp(self, q, k, v, layer, forward_batch, ...):
         )
 ```
 
-## 配置示例
+## Configuration Examples
 
-### EAGLE 配置
+### EAGLE Configuration
 
 ```bash
 python -m sglang.launch_server \
@@ -152,7 +152,7 @@ python -m sglang.launch_server \
     --device npu
 ```
 
-### EAGLE3 配置
+### EAGLE3 Configuration
 
 ```bash
 python -m sglang.launch_server \
@@ -163,7 +163,7 @@ python -m sglang.launch_server \
     --device npu
 ```
 
-### STANDALONE 配置
+### STANDALONE Configuration
 
 ```bash
 python -m sglang.launch_server \
@@ -174,7 +174,7 @@ python -m sglang.launch_server \
     --device npu
 ```
 
-### NGRAM 配置
+### NGRAM Configuration
 
 ```bash
 python -m sglang.launch_server \
@@ -185,59 +185,59 @@ python -m sglang.launch_server \
     --device npu
 ```
 
-## 环境变量
+## Environment Variables
 
-| 变量名 | 说明 | 默认值 |
-|--------|------|--------|
-| `SGLANG_ENABLE_SPEC_V2` | 启用 Spec V2 | 0 |
-| `SGLANG_ENABLE_OVERLAP_PLAN_STREAM` | 启用流重叠 | 0 |
+| Variable Name | Description | Default |
+|---------------|-------------|---------|
+| `SGLANG_ENABLE_SPEC_V2` | Enable Spec V2 | 0 |
+| `SGLANG_ENABLE_OVERLAP_PLAN_STREAM` | Enable stream overlap | 0 |
 
 ```bash
-# 启用投机解码 V2 和流重叠
+# Enable speculative decoding V2 and stream overlap
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 ```
 
-## 推理流程详解
+## Inference Flow Details
 
-### Draft 阶段
+### Draft Phase
 
 ```python
 def forward_draft(self, forward_batch: ForwardBatch):
-    """Draft 模型前向传播"""
+    """Draft model forward pass"""
     
-    # 1. 准备输入
+    # 1. Prepare input
     hidden_states = forward_batch.hidden_states
     
-    # 2. Draft 模型推理 (多步)
+    # 2. Draft model inference (multiple steps)
     for step in range(self.speculative_num_steps):
-        # 获取 draft token
+        # Get draft tokens
         draft_logits = self.draft_worker.forward(hidden_states)
         draft_tokens = sample(draft_logits, topk=self.topk)
         
-        # 更新 hidden states
+        # Update hidden states
         hidden_states = embed(draft_tokens)
     
-    # 3. 返回 draft tokens
+    # 3. Return draft tokens
     return draft_tokens
 ```
 
-### Verify 阶段
+### Verify Phase
 
 ```python
 def forward_verify(self, forward_batch: ForwardBatch):
-    """Target 模型验证"""
+    """Target model verification"""
     
-    # 1. 准备 tree attention mask
+    # 1. Prepare tree attention mask
     tree_mask = build_tree_mask(draft_tokens)
     
-    # 2. Target 模型并行验证所有 draft tokens
+    # 2. Target model parallel verification of all draft tokens
     target_logits = self.target_worker.forward(
         forward_batch,
         attention_mask=tree_mask
     )
     
-    # 3. 接受/拒绝决策
+    # 3. Accept/reject decision
     accepted_tokens = verify_tokens(
         draft_tokens, target_logits,
         threshold=self.accept_threshold
@@ -249,28 +249,28 @@ def forward_verify(self, forward_batch: ForwardBatch):
 ### Tree Attention
 
 ```python
-# 在 eagle_utils.py 中
+# In eagle_utils.py
 def build_tree_kernel_efficient(
     draft_tokens: torch.Tensor,
     topk: int,
     ...
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """构建 tree attention 的 mask 和位置信息"""
+    """Build mask and position info for tree attention"""
     
-    # Tree 结构:
+    # Tree structure:
     #       [root]
     #      /  |  \
-    #    [t1] [t2] [t3]  ← top-k 候选
+    #    [t1] [t2] [t3]  ← top-k candidates
     #    /|    |    |\
     #  ...    ...  ... ...
 ```
 
-## 与 DP Attention 的交互
+## Interaction with DP Attention
 
 ```python
-# 在 eagle_worker_v2.py 中
+# In eagle_worker_v2.py
 if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
-    # EAGLE3 + DP Attention 需要特殊的 TP context
+    # EAGLE3 + DP Attention requires special TP context
     ctx = draft_tp_context(get_attention_tp_group())
 else:
     ctx = empty_context()
@@ -279,90 +279,90 @@ with ctx:
     self.draft_worker = TpModelWorker(...)
 ```
 
-## 常见问题排查
+## Common Issue Troubleshooting
 
-### 1. Draft 模型加载失败
+### 1. Draft Model Loading Failure
 
-**症状**: `RuntimeError: Failed to load draft model`
+**Symptom**: `RuntimeError: Failed to load draft model`
 
-**检查点**:
-- `--speculative-draft-model-path` 是否正确
-- Draft 模型是否与 Target 模型兼容
-- 内存是否足够
+**Checkpoints**:
+- Is `--speculative-draft-model-path` correct
+- Is draft model compatible with target model
+- Is memory sufficient
 
-### 2. 接受率过低
+### 2. Low Acceptance Rate
 
-**症状**: 投机解码加速效果不明显
+**Symptom**: Speculative decoding acceleration not obvious
 
-**检查点**:
-- `--speculative-accept-threshold-single` 设置
-- Draft 模型质量
-- `--speculative-eagle-topk` 是否合适
+**Checkpoints**:
+- `--speculative-accept-threshold-single` setting
+- Draft model quality
+- Is `--speculative-eagle-topk` appropriate
 
-**调优建议**:
+**Tuning Suggestions**:
 ```bash
-# 降低接受阈值
+# Lower acceptance threshold
 --speculative-accept-threshold-single 0.9
 --speculative-accept-threshold-acc 0.95
 
-# 调整 top-k
+# Adjust top-k
 --speculative-eagle-topk 4
 ```
 
-### 3. Graph 捕获失败
+### 3. Graph Capture Failure
 
-**症状**: `RuntimeError: NPU graph capture failed`
+**Symptom**: `RuntimeError: NPU graph capture failed`
 
-**检查点**:
-- 是否有动态控制流
-- 检查 tensor 形状是否固定
-- 检查 `--cuda-graph-bs` 设置
+**Checkpoints**:
+- Is there dynamic control flow
+- Check if tensor shapes are fixed
+- Check `--cuda-graph-bs` setting
 
-### 4. 内存不足
+### 4. Out of Memory
 
-**症状**: OOM 错误
+**Symptom**: OOM errors
 
-**检查点**:
-- Draft 模型额外内存
-- KV Cache 双倍需求
-- `--mem-fraction-static` 设置
+**Checkpoints**:
+- Draft model extra memory
+- KV Cache double requirement
+- `--mem-fraction-static` setting
 
-**解决方案**:
+**Solution**:
 ```bash
-# 减少内存占用
+# Reduce memory usage
 --mem-fraction-static 0.75
 --speculative-num-draft-tokens 32
 ```
 
-## 性能调优建议
+## Performance Tuning Suggestions
 
-### 1. 选择合适的算法
+### 1. Choose Appropriate Algorithm
 
-| 场景 | 推荐算法 |
-|------|----------|
-| 有 EAGLE 训练的模型 | EAGLE3 |
-| 通用加速 | STANDALONE |
-| 无额外模型 | NGRAM |
-| 最高加速比 | EAGLE3 + DP Attention |
+| Scenario | Recommended Algorithm |
+|----------|----------------------|
+| EAGLE-trained models | EAGLE3 |
+| General acceleration | STANDALONE |
+| No extra model | NGRAM |
+| Highest speedup | EAGLE3 + DP Attention |
 
-### 2. 参数调优
+### 2. Parameter Tuning
 
 ```bash
-# 高接受率配置
+# High acceptance rate configuration
 --speculative-num-steps 5
 --speculative-eagle-topk 4
 --speculative-num-draft-tokens 32
 
-# 高吞吐配置
+# High throughput configuration
 --speculative-num-steps 8
 --speculative-eagle-topk 8
 --speculative-num-draft-tokens 64
 ```
 
-### 3. 与其他特性组合
+### 3. Combination with Other Features
 
 ```bash
-# EAGLE3 + DP Attention + DeepEP (推荐)
+# EAGLE3 + DP Attention + DeepEP (Recommended)
 python -m sglang.launch_server \
     --model-path /models/deepseek-v3 \
     --speculative-algorithm EAGLE3 \
@@ -371,42 +371,42 @@ python -m sglang.launch_server \
     --device npu
 ```
 
-## 与其他模块的关系
+## Relationship with Other Modules
 
 ```
 Speculative Decoding
-├── Draft 模型: TpModelWorker (is_draft_worker=True)
-├── Target 模型: TpModelWorker
+├── Draft Model: TpModelWorker (is_draft_worker=True)
+├── Target Model: TpModelWorker
 ├── Attention: AscendAttnBackend.forward_mtp()
 ├── Graph: EAGLEDraftNpuGraphRunner
-├── 调度: Scheduler (overlap schedule)
-└── 内存: 共享 req_to_token_pool
+├── Scheduling: Scheduler (overlap schedule)
+└── Memory: Shared req_to_token_pool
 ```
 
-## 调试建议
+## Debugging Suggestions
 
-### 1. 打印接受率
+### 1. Print Acceptance Rate
 
 ```python
-# 在 verify 阶段添加日志
+# Add logging in verify phase
 accepted_count = sum(accepted_tokens)
 total_count = len(draft_tokens)
 accept_rate = accepted_count / total_count
 logger.info(f"Accept rate: {accept_rate:.2%}")
 ```
 
-### 2. 检查 Draft 输出
+### 2. Check Draft Output
 
 ```python
-# 在 draft 阶段添加日志
+# Add logging in draft phase
 logger.info(f"Draft tokens: {draft_tokens}")
 logger.info(f"Draft logits shape: {draft_logits.shape}")
 ```
 
-### 3. 验证 Tree Mask
+### 3. Verify Tree Mask
 
 ```python
-# 检查 tree mask 是否正确
+# Check if tree mask is correct
 assert tree_mask.shape == (num_draft_tokens, num_draft_tokens)
 assert tree_mask.dtype == torch.bool
 ```

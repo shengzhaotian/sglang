@@ -1,26 +1,26 @@
 # NPU KV Cache Reference
 
-## 概述
+## Overview
 
-KV Cache 是 LLM 推理的核心组件，用于存储和复用历史 Key-Value 状态。NPU 上的 KV Cache 实现有其特殊性，包括页式管理、NZ 格式支持等。
+KV Cache is a core component of LLM inference, used to store and reuse historical Key-Value states. NPU KV Cache implementation has specific characteristics including page-based management and NZ format support.
 
-## 核心文件
+## Core Files
 
 ```
 python/sglang/srt/hardware_backend/npu/
-├── memory_pool_npu.py      # NPU 内存池实现
-├── allocator_npu.py        # NPU 内存分配器
+├── memory_pool_npu.py      # NPU memory pool implementation
+├── allocator_npu.py        # NPU memory allocator
 └── attention/
-    ├── ascend_backend.py   # KV Cache 在 attention 中的使用
-    └── mla_preprocess.py   # MLA 模型的 KV Cache 预处理
+    ├── ascend_backend.py   # KV Cache usage in attention
+    └── mla_preprocess.py   # KV Cache preprocessing for MLA models
 ```
 
-## KV Cache 架构
+## KV Cache Architecture
 
-### 标准 (非 MLA) 模型
+### Standard (Non-MLA) Models
 
 ```
-KV Cache 结构:
+KV Cache Structure:
 ┌─────────────────────────────────────────┐
 │  Block 0  │  Block 1  │  Block 2  │ ... │
 ├───────────┼───────────┼───────────┼─────┤
@@ -29,86 +29,86 @@ KV Cache 结构:
 └─────────────────────────────────────────┘
 ```
 
-### MLA 模型
+### MLA Models
 
 ```
-KV Cache 结构 (DeepSeek-V2/V3):
+KV Cache Structure (DeepSeek-V2/V3):
 ┌─────────────────────────────────────────┐
 │  Block 0  │  Block 1  │  Block 2  │ ... │
 ├───────────┼───────────┼───────────┼─────┤
-│ kv_c: [page_size, num_kv_heads, kv_lora_rank]  │  ← 压缩的 KV latent
-│ k_pe: [page_size, num_kv_heads, qk_rope_head_dim] │  ← Key 的 RoPE 部分
+│ kv_c: [page_size, num_kv_heads, kv_lora_rank]  │  ← Compressed KV latent
+│ k_pe: [page_size, num_kv_heads, qk_rope_head_dim] │  ← Key RoPE part
 └─────────────────────────────────────────┘
 ```
 
-**关键区别**: MLA 模型不直接存储 K 和 V，而是存储压缩表示 `kv_c` 和 `k_pe`。
+**Key Difference**: MLA models don't directly store K and V, but store compressed representations `kv_c` and `k_pe`.
 
-## 内存池管理
+## Memory Pool Management
 
-### MemoryPool 类
+### MemoryPool Class
 
-**关键属性**:
+**Key Attributes**:
 
 ```python
 class MemoryPool:
     def __init__(self, ...):
-        self.page_size = page_size          # 页大小 (通常为 1)
-        self.num_layers = num_layers        # 层数
-        self.dtype = dtype                  # 数据类型
+        self.page_size = page_size          # Page size (usually 1)
+        self.num_layers = num_layers        # Number of layers
+        self.dtype = dtype                  # Data type
         
-        # KV Cache 存储
-        self.kv_data = {}                   # 层 ID → tensor
+        # KV Cache storage
+        self.kv_data = {}                   # Layer ID → tensor
 ```
 
-### KV Buffer 操作
+### KV Buffer Operations
 
 ```python
-# 设置 KV buffer
+# Set KV buffer
 def set_kv_buffer(self, layer, cache_loc, k, v):
     """
-    layer: 当前层
-    cache_loc: 写入位置 (slot_mapping)
+    layer: Current layer
+    cache_loc: Write location (slot_mapping)
     k: Key tensor
     v: Value tensor
     """
     
-# 获取 KV buffer
+# Get KV buffer
 def get_kv_buffer(self, layer_id):
     """
-    返回: (k_cache, v_cache)
+    Returns: (k_cache, v_cache)
     """
 ```
 
-### MLA 模型的特殊处理
+### Special Handling for MLA Models
 
 ```python
-# 在 mla_preprocess.py 中
+# In mla_preprocess.py
 def get_kv_cache_and_cache_idx(self, forward_batch):
     k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(self.layer_id)
-    # 注意: MLA 模型中
-    # k_cache 实际存储 kv_c (压缩的 KV)
-    # v_cache 实际存储 k_pe (Key RoPE)
+    # Note: In MLA models
+    # k_cache actually stores kv_c (compressed KV)
+    # v_cache actually stores k_pe (Key RoPE)
     slot_mapping = forward_batch.out_cache_loc.to(dtype=torch.int32)
     return k_cache, v_cache, slot_mapping
 ```
 
-## Page Table 管理
+## Page Table Management
 
-### Block Table 结构
+### Block Table Structure
 
 ```python
 # block_tables: [batch_size, max_seq_pages]
-# 每个元素是一个 block ID，指向 KV Cache 中的对应块
+# Each element is a block ID pointing to the corresponding block in KV Cache
 
-# 示例: 序列长度 10, page_size = 1
+# Example: sequence length 10, page_size = 1
 # block_tables[0] = [5, 8, 12, 25, 33, 41, 55, 60, 71, 82, 0, 0, ...]
-#                                                          ↑ 未使用
+#                                                          ↑ Unused
 ```
 
-### Block Table 构建
+### Block Table Construction
 
 ```python
-# 在 ascend_backend.py 中
+# In ascend_backend.py
 def init_forward_metadata(self, forward_batch: ForwardBatch):
     self.forward_metadata.block_tables = (
         forward_batch.req_to_token_pool.req_to_token[
@@ -118,69 +118,69 @@ def init_forward_metadata(self, forward_batch: ForwardBatch):
     )
 ```
 
-## Cache 格式
+## Cache Formats
 
-### PA_BNSD 格式 (标准)
+### PA_BNSD Format (Standard)
 
 ```
 Layout: [Num_blocks, Block_size, Num_heads, Head_dim]
 
-示例: num_blocks=1000, block_size=1, num_heads=32, head_dim=128
+Example: num_blocks=1000, block_size=1, num_heads=32, head_dim=128
 Shape: [1000, 1, 32, 128]
 ```
 
-### PA_NZ 格式 (NPU 优化)
+### PA_NZ Format (NPU Optimized)
 
 ```
 Layout: [Num_blocks, Num_heads * Head_dim // 16, Block_size, 16]
 
-示例: num_blocks=1000, block_size=1, num_heads=32, head_dim=128
+Example: num_blocks=1000, block_size=1, num_heads=32, head_dim=128
 Shape: [1000, 256, 1, 16]
 
-特点: 16 元素分块，适合 NPU 向量化
+Feature: 16-element blocks, suitable for NPU vectorization
 ```
 
-### 格式转换
+### Format Conversion
 
 ```python
-# 在 mla_preprocess.py 中
+# In mla_preprocess.py
 def _reshape_kv_for_fia_nz(tensor, num_heads, head_dim, page_size):
-    """将 tensor 转换为 FIA NZ 格式"""
+    """Convert tensor to FIA NZ format"""
     return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
 ```
 
 ## Slot Mapping
 
-### 概念
+### Concept
 
-Slot mapping 定义了每个 token 应该写入 KV Cache 的哪个位置。
+Slot mapping defines which position in KV Cache each token should be written to.
 
 ```python
 # slot_mapping: [num_tokens]
-# 每个元素是一个线性索引，指向 cache 中的位置
+# Each element is a linear index pointing to a position in cache
 
-# 示例:
+# Example:
 # tokens: ["Hello", "World", "!"]
-# slot_mapping: [0, 1, 2]  # 写入 cache 的前三个位置
+# slot_mapping: [0, 1, 2]  # Write to first three positions in cache
 ```
 
-### 获取方式
+### How to Get
 
 ```python
-# 在 forward_batch 中
+# In forward_batch
 slot_mapping = forward_batch.out_cache_loc
 
-# 转换为所需类型
+# Convert to required type
 slot_mapping_int32 = slot_mapping.to(dtype=torch.int32)
 slot_mapping_int64 = slot_mapping.to(dtype=torch.int64)
 ```
 
-## Cache 写入操作
+## Cache Write Operations
 
-### 标准 Cache 写入
+### Standard Cache Write
 
 ```python
-# 在 ascend_backend.py 的 forward_extend 中
+# In ascend_backend.py forward_extend
 if save_kv_cache and k is not None and v is not None:
     cache_loc = (
         forward_batch.out_cache_loc
@@ -190,46 +190,46 @@ if save_kv_cache and k is not None and v is not None:
     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 ```
 
-### MLA Cache 写入
+### MLA Cache Write
 
 ```python
-# 方式 1: 直接写入
+# Method 1: Direct write
 forward_batch.token_to_kv_pool.set_kv_buffer(
     layer, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
 )
 
-# 方式 2: 通过 npu_kv_rmsnorm_rope_cache 写入
+# Method 2: Write via npu_kv_rmsnorm_rope_cache
 torch_npu.npu_kv_rmsnorm_rope_cache(
     latent_cache,
     layernorm_weight,
     cos, sin,
     slot_mapping,
-    k_rope_cache,    # 输出: k_pe cache
-    c_kv_cache,      # 输出: kv_c cache
+    k_rope_cache,    # Output: k_pe cache
+    c_kv_cache,      # Output: kv_c cache
     ...
 )
 ```
 
-## Cache 读取操作
+## Cache Read Operations
 
-### 标准 Cache 读取
+### Standard Cache Read
 
 ```python
 k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-# reshape 用于 attention 计算
+# Reshape for attention computation
 k_cache = k_cache.view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
 v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
 ```
 
-### MLA Cache 读取
+### MLA Cache Read
 
 ```python
 kv_c = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 k_pe = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-# 对于 FIA NZ 格式
+# For FIA NZ format
 if is_fia_nz():
     k_rope_cache = _reshape_kv_for_fia_nz(k_pe, ...)
     c_kv_cache = _reshape_kv_for_fia_nz(kv_c, ...)
@@ -238,54 +238,54 @@ else:
     c_kv_cache = kv_c.view(-1, self.page_size, ...)
 ```
 
-## 常见问题排查
+## Common Issue Troubleshooting
 
-### 1. Cache 位置错误
+### 1. Cache Location Errors
 
-**症状**: 推理结果错误或 crash
+**Symptom**: Incorrect inference results or crash
 
-**检查点**:
-- `slot_mapping` 是否正确
-- `block_tables` 是否正确构建
-- `req_pool_indices` 是否有效
+**Checkpoints**:
+- Is `slot_mapping` correct
+- Is `block_tables` correctly constructed
+- Are `req_pool_indices` valid
 
-**调试代码**:
+**Debug Code**:
 ```python
 print(f"slot_mapping: {forward_batch.out_cache_loc}")
 print(f"block_tables shape: {self.forward_metadata.block_tables.shape}")
 print(f"seq_lens: {forward_batch.seq_lens}")
 ```
 
-### 2. 维度不匹配
+### 2. Dimension Mismatch
 
-**症状**: `RuntimeError: shape mismatch`
+**Symptom**: `RuntimeError: shape mismatch`
 
-**检查点**:
-- `num_heads` 是否考虑了 TP 分片
-- `head_dim` 是否正确 (MLA: `kv_lora_rank` vs `qk_head_dim`)
-- `page_size` 是否一致
+**Checkpoints**:
+- Does `num_heads` account for TP sharding
+- Is `head_dim` correct (MLA: `kv_lora_rank` vs `qk_head_dim`)
+- Is `page_size` consistent
 
-### 3. 格式错误
+### 3. Format Errors
 
-**症状**: FIA 算子报错
+**Symptom**: FIA operator errors
 
-**检查点**:
-- `SGLANG_USE_FIA_NZ` 是否设置正确
-- cache 格式是否与算子期望一致
-- 检查 `cache_mode` 参数
+**Checkpoints**:
+- Is `SGLANG_USE_FIA_NZ` set correctly
+- Does cache format match operator expectation
+- Check `cache_mode` parameter
 
-### 4. 内存不足
+### 4. Out of Memory
 
-**症状**: OOM 错误
+**Symptom**: OOM errors
 
-**检查点**:
-- `mem_fraction_static` 设置是否合理
-- `max_model_len` 是否过大
-- 检查实际 cache 大小
+**Checkpoints**:
+- Is `mem_fraction_static` set reasonably
+- Is `max_model_len` too large
+- Check actual cache size
 
-**计算公式**:
+**Calculation Formula**:
 ```python
-# 每 token 的 KV Cache 大小
+# KV Cache size per token
 bytes_per_token = (
     2  # K + V
     * num_layers
@@ -294,35 +294,35 @@ bytes_per_token = (
     * dtype_bytes  # 2 for fp16/bf16
 )
 
-# 总 Cache 大小
+# Total Cache size
 total_cache_size = max_model_len * bytes_per_token * max_running_requests
 ```
 
-## 性能优化建议
+## Performance Optimization Suggestions
 
-### 1. 页大小选择
+### 1. Page Size Selection
 
-- 小 `page_size` (1): 内存利用率高，但管理开销大
-- 大 `page_size` (16, 32): 管理开销小，但可能有碎片
+- Small `page_size` (1): High memory utilization, but high management overhead
+- Large `page_size` (16, 32): Low management overhead, but potential fragmentation
 
-### 2. 格式选择
+### 2. Format Selection
 
-- `PA_BNSD`: 通用性好，调试方便
-- `PA_NZ`: NPU 性能更优，但需要特定环境变量
+- `PA_BNSD`: Good compatibility, easy debugging
+- `PA_NZ`: Better NPU performance, but requires specific environment variables
 
-### 3. 预分配
+### 3. Pre-allocation
 
 ```python
-# 提前分配足够的 cache 空间
---mem-fraction-static 0.85  # 预留 85% 内存给静态分配
+# Pre-allocate enough cache space
+--mem-fraction-static 0.85  # Reserve 85% memory for static allocation
 ```
 
-## 与其他模块的关系
+## Relationship with Other Modules
 
 ```
 KV Cache
-├── 输入: token positions (来自 scheduler)
-├── 管理: MemoryPool, req_to_token_pool
-├── 消费: Attention Backend
-└── 特殊处理: MLA Preprocess (压缩表示)
+├── Input: token positions (from scheduler)
+├── Management: MemoryPool, req_to_token_pool
+├── Consumer: Attention Backend
+└── Special Handling: MLA Preprocess (compressed representation)
 ```

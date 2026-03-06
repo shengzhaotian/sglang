@@ -1,60 +1,60 @@
 # NPU Attention Backend Reference
 
-## 概述
+## Overview
 
-NPU Attention 后端是 SGLang 在华为昇腾 NPU 上运行的核心组件，负责处理所有注意力计算。
+The NPU Attention backend is a core component of SGLang running on Huawei Ascend NPUs, responsible for handling all attention computations.
 
-## 核心文件
+## Core Files
 
 ```
 python/sglang/srt/hardware_backend/npu/attention/
-├── ascend_backend.py           # 主后端实现
-├── ascend_torch_native_backend.py  # Torch Native SDPA 后端
-└── mla_preprocess.py           # MLA 预处理模块
+├── ascend_backend.py           # Main backend implementation
+├── ascend_torch_native_backend.py  # Torch Native SDPA backend
+└── mla_preprocess.py           # MLA preprocessing module
 ```
 
-## AscendAttnBackend 类结构
+## AscendAttnBackend Class Structure
 
-### 初始化参数
+### Initialization Parameters
 
-| 参数 | 来源 | 说明 |
-|------|------|------|
-| `device` | `model_runner.device` | NPU 设备 |
-| `page_size` | `model_runner.page_size` | KV cache 页大小 |
-| `use_mla` | `model_config.attention_arch == AttentionArch.MLA` | 是否使用 MLA 架构 |
-| `kv_lora_rank` | `model_config.kv_lora_rank` | MLA 的 KV LoRA 秩 |
-| `qk_rope_head_dim` | `model_config.qk_rope_head_dim` | RoPE 维度 |
-| `qk_nope_head_dim` | `model_config.qk_nope_head_dim` | 非 RoPE 维度 |
-| `use_fia` | `ASCEND_USE_FIA` 环境变量 | 是否使用 FIA 后端 |
+| Parameter | Source | Description |
+|-----------|--------|-------------|
+| `device` | `model_runner.device` | NPU device |
+| `page_size` | `model_runner.page_size` | KV cache page size |
+| `use_mla` | `model_config.attention_arch == AttentionArch.MLA` | Whether to use MLA architecture |
+| `kv_lora_rank` | `model_config.kv_lora_rank` | KV LoRA rank for MLA |
+| `qk_rope_head_dim` | `model_config.qk_rope_head_dim` | RoPE dimension |
+| `qk_nope_head_dim` | `model_config.qk_nope_head_dim` | Non-RoPE dimension |
+| `use_fia` | `ASCEND_USE_FIA` environment variable | Whether to use FIA backend |
 
-### 核心方法
+### Core Methods
 
-#### 1. forward_extend (扩展阶段)
+#### 1. forward_extend (Extension Phase)
 
-**用途**: 处理 prefill 和 extend 请求
+**Purpose**: Handle prefill and extend requests
 
-**关键路径选择**:
+**Key Path Selection**:
 
 ```
 forward_extend()
-├── topk_indices != None? → forward_sparse() (NSA/稀疏注意力)
-├── is_target_verify() or is_draft_extend()? → forward_mtp() (推测解码)
+├── topk_indices != None? → forward_sparse() (NSA/sparse attention)
+├── is_target_verify() or is_draft_extend()? → forward_mtp() (speculative decoding)
 ├── use_mla == False?
-│   ├── use_fia == True? → npu_fused_infer_attention_score (FIA路径)
+│   ├── use_fia == True? → npu_fused_infer_attention_score (FIA path)
 │   ├── qk_head_dim <= 128 and causal? → _npu_flash_attention_qlens
 │   └── else → native_attn.run_sdpa_forward_extend
 └── use_mla == True?
-    ├── prefix_lens > 0? → npu_ring_mla (两阶段计算)
-    └── else → FIA 或 native SDPA
+    ├── prefix_lens > 0? → npu_ring_mla (two-stage computation)
+    └── else → FIA or native SDPA
 ```
 
-**关键代码位置**: `ascend_backend.py:714-1087`
+**Key Code Location**: `ascend_backend.py:714-1087`
 
-#### 2. forward_decode (解码阶段)
+#### 2. forward_decode (Decode Phase)
 
-**用途**: 处理 decode 请求
+**Purpose**: Handle decode requests
 
-**关键路径选择**:
+**Key Path Selection**:
 
 ```
 forward_decode()
@@ -68,108 +68,108 @@ forward_decode()
     └── else → _npu_paged_attention_mla
 ```
 
-**关键代码位置**: `ascend_backend.py:1427-1677`
+**Key Code Location**: `ascend_backend.py:1427-1677`
 
-#### 3. forward_mtp (推测解码)
+#### 3. forward_mtp (Speculative Decoding)
 
-**用途**: 处理 MTP (Multi-Token Prediction) 推测解码
+**Purpose**: Handle MTP (Multi-Token Prediction) speculative decoding
 
-**关键代码位置**: `ascend_backend.py:1088-1267`
+**Key Code Location**: `ascend_backend.py:1088-1267`
 
-## NPU 算子参考
+## NPU Operator Reference
 
 ### npu_fused_infer_attention_score (FIA)
 
-**用途**: 华为 CANN 提供的融合注意力算子
+**Purpose**: Fused attention operator provided by Huawei CANN
 
-**关键参数**:
+**Key Parameters**:
 
-| 参数 | 说明 | 常用值 |
-|------|------|--------|
-| `input_layout` | 输入布局 | "TND", "BSND", "BSH" |
-| `sparse_mode` | 稀疏模式 | 0 (无mask), 3 (因果mask) |
-| `num_heads` | Query 头数 | - |
-| `num_key_value_heads` | KV 头数 | - |
-| `scale` | 缩放因子 | `1/sqrt(head_dim)` |
-| `block_table` | KV cache 页表 | - |
-| `block_size` | 页大小 | - |
-| `actual_seq_lengths` | Query 实际序列长度 | - |
-| `actual_seq_lengths_kv` | KV 实际序列长度 | - |
+| Parameter | Description | Common Values |
+|-----------|-------------|---------------|
+| `input_layout` | Input layout | "TND", "BSND", "BSH" |
+| `sparse_mode` | Sparse mode | 0 (no mask), 3 (causal mask) |
+| `num_heads` | Number of query heads | - |
+| `num_key_value_heads` | Number of KV heads | - |
+| `scale` | Scale factor | `1/sqrt(head_dim)` |
+| `block_table` | KV cache page table | - |
+| `block_size` | Page size | - |
+| `actual_seq_lengths` | Query actual sequence length | - |
+| `actual_seq_lengths_kv` | KV actual sequence length | - |
 
-**布局说明**:
-- `TND`: [Token, Num_heads, Head_dim] - 适用于变长序列
-- `BSND`: [Batch, Seq, Num_heads, Head_dim] - 适用于固定批次
-- `BSH`: [Batch, Seq, Hidden] - 适用于单头或融合布局
+**Layout Description**:
+- `TND`: [Token, Num_heads, Head_dim] - Suitable for variable-length sequences
+- `BSND`: [Batch, Seq, Num_heads, Head_dim] - Suitable for fixed batches
+- `BSH`: [Batch, Seq, Hidden] - Suitable for single-head or fused layouts
 
 ### _npu_flash_attention_qlens
 
-**用途**: 支持变长序列的 Flash Attention
+**Purpose**: Flash Attention supporting variable-length sequences
 
-**关键参数**:
+**Key Parameters**:
 - `query`: [Total_tokens, Hidden]
-- `key_cache`: KV cache 键
-- `value_cache`: KV cache 值
-- `mask`: 注意力掩码
-- `block_table`: 页表
-- `seq_len`: 扩展长度
-- `context_lens`: 上下文长度
+- `key_cache`: KV cache keys
+- `value_cache`: KV cache values
+- `mask`: Attention mask
+- `block_table`: Page table
+- `seq_len`: Extension length
+- `context_lens`: Context length
 
 ### _npu_paged_attention
 
-**用途**: 解码阶段的 Paged Attention
+**Purpose**: Paged Attention for decode phase
 
-**关键参数**:
+**Key Parameters**:
 - `query`: [Num_tokens, Num_heads, Head_dim]
 - `key_cache`: KV cache
 - `value_cache`: KV cache
-- `block_table`: 页表
-- `context_lens`: 上下文长度
+- `block_table`: Page table
+- `context_lens`: Context length
 
 ### npu_ring_mla
 
-**用途**: MLA 架构的环形注意力计算
+**Purpose**: Ring attention computation for MLA architecture
 
-**关键参数**:
-- `q_nope`, `q_rope`: Query 的非 RoPE 和 RoPE 部分
-- `k_nope`, `k_rope`: Key 的非 RoPE 和 RoPE 部分
+**Key Parameters**:
+- `q_nope`, `q_rope`: Non-RoPE and RoPE parts of query
+- `k_nope`, `k_rope`: Non-RoPE and RoPE parts of key
 - `value`: Value
-- `mask`: 注意力掩码
-- `seqlen`: 序列长度
+- `mask`: Attention mask
+- `seqlen`: Sequence length
 - `kernel_type`: "kernel_type_high_precision"
-- `mask_type`: "mask_type_triu" 或 "no_mask"
-- `calc_type`: "calc_type_first_ring" 或 "calc_type_default"
+- `mask_type`: "mask_type_triu" or "no_mask"
+- `calc_type`: "calc_type_first_ring" or "calc_type_default"
 
-## MLA vs 非 MLA 差异
+## MLA vs Non-MLA Differences
 
-### 非 MLA 模型
-- K 和 V 分别存储
-- 标准 QKV 投影
-- 使用 `_npu_paged_attention` 或 FIA
+### Non-MLA Models
+- K and V stored separately
+- Standard QKV projection
+- Uses `_npu_paged_attention` or FIA
 
-### MLA 模型 (DeepSeek-V2/V3)
-- K 压缩为 latent representation
-- 分离 `q_nope` 和 `q_pe` (RoPE 部分)
-- 使用 `npu_ring_mla` 或 `_npu_paged_attention_mla`
-- 需要额外的 `kv_b_proj` 解压缩
+### MLA Models (DeepSeek-V2/V3)
+- K compressed as latent representation
+- Separated `q_nope` and `q_pe` (RoPE part)
+- Uses `npu_ring_mla` or `_npu_paged_attention_mla`
+- Requires additional `kv_b_proj` for decompression
 
-## 常见问题排查
+## Common Issue Troubleshooting
 
-### 1. 维度不匹配
-- 检查 `qk_head_dim` vs `v_head_dim`
-- MLA 模型中 `qk_head_dim != v_head_dim` 是正常的
-- 确认 `num_heads` 和 `num_kv_heads` 的 GQA 比例
+### 1. Dimension Mismatch
+- Check `qk_head_dim` vs `v_head_dim`
+- In MLA models, `qk_head_dim != v_head_dim` is normal
+- Confirm GQA ratio of `num_heads` and `num_kv_heads`
 
-### 2. 布局错误
-- FIA 路径: 检查 `input_layout` 参数
-- 非 FIA 路径: 检查 tensor reshape 是否正确
-- NZ 格式: 检查 `SGLANG_USE_FIA_NZ` 环境变量
+### 2. Layout Errors
+- FIA path: Check `input_layout` parameter
+- Non-FIA path: Check if tensor reshape is correct
+- NZ format: Check `SGLANG_USE_FIA_NZ` environment variable
 
-### 3. 掩码问题
-- `sparse_mode=3` 用于因果注意力
-- `sparse_mode=0` 用于无掩码 (decode 阶段)
-- 检查 `atten_mask` 是否正确初始化
+### 3. Mask Issues
+- `sparse_mode=3` for causal attention
+- `sparse_mode=0` for no mask (decode phase)
+- Check if `atten_mask` is correctly initialized
 
-### 4. 性能问题
-- 检查是否启用了 FIA (`ASCEND_USE_FIA=1`)
-- MLA 模型检查 `SGLANG_NPU_USE_MLAPO`
-- 检查 graph mode 是否正确启用
+### 4. Performance Issues
+- Check if FIA is enabled (`ASCEND_USE_FIA=1`)
+- For MLA models, check `SGLANG_NPU_USE_MLAPO`
+- Check if graph mode is correctly enabled
