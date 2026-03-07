@@ -62,6 +62,71 @@ python -c "import sglang"
 - One single signed commit (`git commit -sm ...`)
 - Final docs in Chinese, compact
 - **Dummy-first encouraged, but real-weight validation is MANDATORY**
+- **Accuracy validation is MANDATORY** - model loading ≠ correct outputs
+
+## NPU Hardware Limitations
+
+### Critical: Attention Head Count Requirement
+
+**NPU fused attention operator requires attention head count to be a power of 2** (1, 2, 4, 8, 16, 32, 64, 128).
+
+**Pre-flight Check**:
+```python
+def _is_power_of_two(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+# Calculate heads per device
+heads_per_device = total_heads // tp_size
+if not _is_power_of_two(heads_per_device):
+    # Must use --disable-cuda-graph
+    print(f"WARNING: {heads_per_device} heads/device is not power of 2")
+    print(f"         CUDA Graph will be disabled")
+```
+
+**Workaround**: Use `--disable-cuda-graph` to fall back to native SDPA implementation.
+
+### Common Head Count Scenarios
+
+| Total Heads | TP Size | Heads/Device | Power of 2? | Action |
+|-------------|---------|--------------|-------------|--------|
+| 32 | 1 | 32 | ✅ Yes | CUDA Graph OK |
+| 32 | 2 | 16 | ✅ Yes | CUDA Graph OK |
+| 32 | 4 | 8 | ✅ Yes | CUDA Graph OK |
+| 20 | 1 | 20 | ❌ No | Disable CUDA Graph |
+| 20 | 2 | 10 | ❌ No | Disable CUDA Graph |
+| 64 | 8 | 8 | ✅ Yes | CUDA Graph OK |
+
+### RoPE Implementation Differences
+
+**Problem**: `npu_mrope` is designed for multi-modal RoPE and expects different input format than standard RoPE.
+
+**Solution**: Use `npu_interleave_rope` for standard RoPE:
+```python
+# WRONG: npu_mrope expects 4D tensors for multimodal
+query_out, key_out = torch_npu.npu_mrope(positions, query, key, ...)
+
+# CORRECT: npu_interleave_rope for standard RoPE
+# Reshape to [batch, heads, 1, dim]
+q_pe = q_pe.reshape(num_tokens, num_heads, 1, rotary_dim)
+cos = cos.reshape(num_tokens, 1, 1, rotary_dim).contiguous()
+sin = sin.reshape(num_tokens, 1, 1, rotary_dim).contiguous()
+q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin)
+```
+
+### MLA Attention Format Handling
+
+**Problem**: When backend is in `FORWARD_ABSORB_CORE_ATTENTION_BACKENDS`, attention receives `q_nope_out` (latent format) and `q_rope` separately. Native SDPA doesn't support this format directly.
+
+**Solution**: Concatenate query/key parts before passing to native SDPA:
+```python
+if q_rope is not None:
+    # q is in latent format (kv_lora_rank dimension)
+    # q_rope is the rope part separately
+    # Concatenate to form full query for standard attention
+    q_full = torch.cat([q, q_rope], dim=-1)
+    k_full = torch.cat([k, k_rope], dim=-1) if k_rope is not None else k
+    # Use q_full and k_full for attention computation
+```
 
 ## NPU Reference Documentation
 
@@ -177,6 +242,43 @@ python -m sglang.launch_server \
 - Weight key mapping correct
 - KV/QK norm sharding validated
 
+### 5.5) Accuracy Validation (MANDATORY)
+
+**Model loading successfully does NOT guarantee correct outputs.** Always run accuracy tests.
+
+#### Quick Accuracy Test Suite
+
+```bash
+# Test 1: Simple math
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "<model>", "messages": [{"role": "user", "content": "What is 15 times 7?"}], "max_tokens": 100, "temperature": 0}'
+
+# Test 2: Knowledge question
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "<model>", "messages": [{"role": "user", "content": "What is the largest planet in our solar system?"}], "max_tokens": 100, "temperature": 0}'
+
+# Test 3: Logic reasoning
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "<model>", "messages": [{"role": "user", "content": "If A > B and B > C, is A > C?"}], "max_tokens": 100, "temperature": 0}'
+```
+
+#### Expected Results Template
+
+| Test Type | Question | Expected Answer | Model Output | Status |
+|-----------|----------|-----------------|--------------|--------|
+| Math | 15 × 7 = ? | 105 | ___ | ✅/❌ |
+| Knowledge | Largest planet? | Jupiter | ___ | ✅/❌ |
+| Logic | A>B, B>C → A>C? | Yes | ___ | ✅/❌ |
+
+#### Special Considerations
+
+- **Reasoning models** (e.g., GLM-4.7-flash): Use `max_tokens >= 500` to get complete responses with reasoning
+- **Check `finish_reason`**: Should be `stop`, not `length`
+- **Verify response completeness**: Ensure the model finishes its response
+
 ### 6) Validate Features
 
 - Feature-first: EP + ACLGraph first; eager as fallback
@@ -262,12 +364,35 @@ See [shared/npu_common_reference.md](../shared/npu_common_reference.md) for erro
 
 - [ ] Service starts from implementation roots
 - [ ] OpenAI-compatible inference succeeds (not startup-only)
+- [ ] **Accuracy validation passed** (minimum 3 tests: math, knowledge, logic)
 - [ ] Feature set attempted: ACLGraph/DeepEP/MTP/multimodal
 - [ ] Capacity baseline (`128k + bs16`) reported
 - [ ] Dummy + real-weight evidence present
 - [ ] Tutorial doc exists at `./<ModelName>.md`
 - [ ] One signed commit in current repo
 - [ ] Final response includes: commit hash, file paths, commands, limits
+
+## Common Pitfalls
+
+### 1. Assuming CUDA Code Works on NPU
+**Problem**: CUDA-specific implementations may fail silently or produce incorrect results on NPU.
+**Solution**: Always test NPU-specific code paths with real inputs.
+
+### 2. Skipping Accuracy Validation
+**Problem**: Model loading successfully does NOT mean outputs are correct.
+**Solution**: Run accuracy tests after real-weight validation.
+
+### 3. Modifying Shared Code Without Guards
+**Problem**: Changes to shared code may break CUDA path.
+**Solution**: Use `is_npu()` check or create NPU-specific files in `hardware_backend/npu/`.
+
+### 4. Ignoring Token Limits for Reasoning Models
+**Problem**: Reasoning models output thinking process before answer, may get truncated.
+**Solution**: Use `max_tokens >= 500` for reasoning models, check `finish_reason`.
+
+### 5. Not Checking Head Count Before CUDA Graph
+**Problem**: CUDA Graph fails with non-power-of-2 head counts.
+**Solution**: Pre-flight check head count, use `--disable-cuda-graph` if needed.
 
 ## Completion Criteria
 
