@@ -235,21 +235,54 @@ class RotaryEmbedding(MultiPlatformOp):
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
         if query.dtype == torch.bfloat16 and self.cos_sin_cache.dtype == torch.float:
             return self.forward_native(positions, query, key, offsets)
-        if self.is_neox_style:
-            rotary_mode = "half"
+
+        # Use npu_interleave_rope for standard RoPE on NPU
+        # npu_mrope is designed for multi-modal RoPE and expects different input format
+        if offsets is not None:
+            positions = positions + offsets
+        positions = positions.flatten()
+        num_tokens = positions.shape[0]
+
+        # Get cos/sin from cache
+        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+
+        # Expand cos/sin for interleave format
+        cos = cos.repeat(1, 2)
+        sin = sin.repeat(1, 2)
+
+        query_shape = query.shape
+        key_shape = key.shape
+        query = query.view(num_tokens, -1, self.head_size)
+        key = key.view(num_tokens, -1, self.head_size)
+
+        query_rot = query[..., : self.rotary_dim]
+        query_pass = query[..., self.rotary_dim :]
+        key_rot = key[..., : self.rotary_dim]
+        key_pass = key[..., self.rotary_dim :]
+
+        # Reshape for npu_interleave_rope: [batch, heads, 1, dim]
+        num_q_heads = query_rot.shape[1]
+        num_k_heads = key_rot.shape[1]
+        query_rot = query_rot.reshape(num_tokens, num_q_heads, 1, self.rotary_dim)
+        key_rot = key_rot.reshape(num_tokens, num_k_heads, 1, self.rotary_dim)
+        cos = cos.reshape(num_tokens, 1, 1, self.rotary_dim).contiguous()
+        sin = sin.reshape(num_tokens, 1, 1, self.rotary_dim).contiguous()
+
+        query_rot = torch_npu.npu_interleave_rope(query_rot, cos, sin)
+        key_rot = torch_npu.npu_interleave_rope(key_rot, cos, sin)
+
+        query_rot = query_rot.reshape(num_tokens, num_q_heads, self.rotary_dim)
+        key_rot = key_rot.reshape(num_tokens, num_k_heads, self.rotary_dim)
+
+        if self.rotary_dim < self.head_size:
+            query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+            key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         else:
-            rotary_mode = "interleave"
-        mrope_section = [0, 0, 0]
-        query_out, key_out = torch_npu.npu_mrope(
-            positions,
-            query,
-            key,
-            self.cos_sin_cache,
-            self.head_size,
-            mrope_section=mrope_section,
-            rotary_mode=rotary_mode,
-        )
-        return query_out, key_out
+            query = query_rot.reshape(query_shape)
+            key = key_rot.reshape(key_shape)
+
+        return query, key
 
     def forward_cpu(
         self,

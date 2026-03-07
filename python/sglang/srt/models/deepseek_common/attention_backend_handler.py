@@ -35,7 +35,20 @@ def _dispatch_mla_subtype(attn, forward_batch):
             return AttnForwardMethod.MLA
 
 
+def _is_power_of_two(n):
+    """Check if n is a power of 2."""
+    return n > 0 and (n & (n - 1)) == 0
+
+
 def handle_attention_ascend(attn, forward_batch):
+    # Check if num_local_heads is a power of 2 (required by NPU fused attention)
+    # If not, fall back to native MLA implementation
+    use_native_mla = not _is_power_of_two(attn.num_local_heads)
+
+    if use_native_mla:
+        # Fall back to native MLA implementation for non-power-of-2 heads
+        return AttnForwardMethod.MLA
+
     if (
         forward_batch.forward_mode.is_extend()
         and not forward_batch.forward_mode.is_target_verify()

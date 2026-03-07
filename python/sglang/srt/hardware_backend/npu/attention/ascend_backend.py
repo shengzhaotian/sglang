@@ -41,6 +41,11 @@ def _reshape_kv_for_fia_nz(
     return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
 
 
+def _is_power_of_two(n: int) -> bool:
+    """Check if n is a power of 2."""
+    return n > 0 and (n & (n - 1)) == 0
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -1007,7 +1012,54 @@ class AscendAttnBackend(AttentionBackend):
             assert (
                 layer.qk_head_dim != layer.v_head_dim
             ), "FIA only supports qk_head_dim != v_head_dim"
-            if layer.v_head_dim in [256]:
+
+            # When q_rope is provided, q is already q_nope_out (in latent format with kv_lora_rank dimension)
+            # This happens when ascend is in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+            # For MLA models, we need to concatenate q_nope and q_rope for standard attention
+            if q_rope is not None:
+                # q is already in latent format (kv_lora_rank dimension)
+                # q_rope and k_rope are already provided separately
+                # Concatenate to form full query and key for standard MLA attention
+                q_full = torch.cat([q, q_rope], dim=-1)
+                k_full = torch.cat([k, k_rope], dim=-1) if k_rope is not None else k
+
+                kv_lora_rank = q.shape[-1]
+                if save_kv_cache:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, forward_batch.out_cache_loc, k, k_rope
+                    )
+
+                attn_output = q_full.new_empty(
+                    (q_full.shape[0], layer.tp_q_head_num, kv_lora_rank)
+                )
+                use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+
+                k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                v_cache = forward_batch.token_to_kv_pool.get_value_buffer(
+                    layer.layer_id
+                )
+                kv_cache = torch.cat([k_cache, v_cache], dim=-1)
+
+                # Use q_full and k_full for standard MLA attention
+                # Note: q_full has shape [batch, heads, kv_lora_rank + qk_rope_head_dim]
+                # kv_cache has shape [total_tokens, heads, kv_lora_rank + qk_rope_head_dim]
+                attn_output = self.native_attn.run_sdpa_forward_extend(
+                    q_full,
+                    attn_output,
+                    kv_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    k_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    forward_batch.req_to_token_pool.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.extend_prefix_lens,
+                    forward_batch.extend_seq_lens,
+                    scaling=layer.scaling,
+                    enable_gqa=use_gqa,
+                    causal=True,
+                )
+                # Output is in latent format (kv_lora_rank dimension)
+                # No need to reshape as the native attention outputs the correct shape
+            elif layer.v_head_dim in [256]:
                 """Currently, in NO_QUANT situation, qk_nope_head_dim == v_head_dim, and rope exists, v_head_dim only support 512 and 128"""
                 kv_lora_rank = k.shape[-1] - self.qk_rope_head_dim
                 kv_c, k_rope = k.split([kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -1045,11 +1097,14 @@ class AscendAttnBackend(AttentionBackend):
                     data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
                 ]
 
+                # For MLA models, use qk_nope_head_dim instead of v_head_dim for query split
+                # qk_nope_head_dim: dimension of non-rope part of query/key
+                # qk_rope_head_dim: dimension of rope part of query/key
                 q_nope, q_rope = q.split(
-                    [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+                    [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
                 )
                 k_nope, k_rope = k.split(
-                    [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+                    [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
                 )
 
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(

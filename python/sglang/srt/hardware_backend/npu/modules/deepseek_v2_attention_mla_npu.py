@@ -227,7 +227,22 @@ def forward_mla_prepare_npu(
         if nsa_use_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        # Use npu_interleave_rope for MLA models on NPU
+        # q_pe shape: [batch_size, num_heads, qk_rope_head_dim]
+        # k_pe shape: [batch_size, 1, qk_rope_head_dim]
+        cos_sin = m.rotary_emb.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        # Expand cos/sin for interleave rope (repeat for interleaved format)
+        cos = cos.repeat(1, 2)
+        sin = sin.repeat(1, 2)
+        q_pe = q_pe.reshape(-1, m.num_local_heads, 1, m.qk_rope_head_dim)
+        k_pe = k_pe.reshape(-1, 1, 1, m.qk_rope_head_dim)
+        cos = cos.reshape(-1, 1, 1, m.qk_rope_head_dim).contiguous()
+        sin = sin.reshape(-1, 1, 1, m.qk_rope_head_dim).contiguous()
+        q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin)
+        k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
+        q_pe = q_pe.reshape(-1, m.num_local_heads, m.qk_rope_head_dim)
+        k_pe = k_pe.reshape(-1, 1, m.qk_rope_head_dim)
 
         if nsa_use_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
             # support allgather+rerrange
