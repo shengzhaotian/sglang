@@ -1,0 +1,7 @@
+TRAECLI_PERSONAL_ACCESS_TOKEN="trae-lt-9ea1dc65120c869976bd14c32408b5240c94df61ecaf757ef43ec810" traecli
+
+TRAECLI_PERSONAL_ACCESS_TOKEN="trae-lt-7a0641cfc190f3466c52695b93e50036f5fa06a6c5495400113fa317" traecli
+
+export PATH=~/.local/bin:$PATH
+export LC_ALL=zh_CH.UTF-8
+I want to creat AGENTS.md for the current code repository to facilitate subsequent feature development and new model adaptation on NPUs. How to do this? Please list out the plan and outlines.
