@@ -155,21 +155,84 @@ def forward(self, x):
 - Confirm delivery root (current git repo)
 - Use default feature set: ACLGraph + DeepEP + MTP + multimodal (if VL)
 
-### Step 2: Resource Assessment (Conditional)
+### Step 2: Resource Assessment (MANDATORY)
 
-**Skip if model fits single card.** Only assess when:
-- Model > 60GB parameters
-- TP size > 1 required
+**Always run memory assessment before launching server.** OOM during startup wastes time and may corrupt state.
 
-```bash
-# Quick check (run only if needed)
-python -c "import torch, json; \
-  mem = torch.npu.get_device_properties(0).total_memory/1e9; \
-  c = json.load(open('/models/<model>/config.json')); \
-  print(f'NPU: {mem:.0f}GB | Model: {c.get(\"hidden_size\")}h × {c.get(\"num_hidden_layers\")}L')"
+```python
+# Run this assessment script
+python -c "
+import torch, json, math, sys
+path = sys.argv[1] if len(sys.argv) > 1 else '/models/<model>'
+if not path.endswith('.json'): path += '/config.json'
+cfg = json.load(open(path))
+
+h = cfg.get('hidden_size', 0)
+l = cfg.get('num_hidden_layers', 0)
+v = cfg.get('vocab_size', 0)
+inter = cfg.get('intermediate_size', h * 4)
+heads = cfg.get('num_attention_heads', h)
+kv_heads = cfg.get('num_key_value_heads', heads)
+head_dim = cfg.get('head_dim', h // heads)
+experts = cfg.get('num_experts', 0)
+
+# Weight estimation
+embed = v * h * 2
+attn = l * (h * h + 2 * h * kv_heads * head_dim + kv_heads * head_dim * h) * 2
+mlp = l * 3 * h * inter * 2
+moe = l * experts * 3 * h * cfg.get('moe_intermediate_size', inter) * 2 if experts else 0
+weights_gb = (embed + attn + mlp + moe) / 1e9
+
+# KV cache per token
+kv_lora = cfg.get('kv_lora_rank', 0)
+if kv_lora > 0:
+    kv_per_token = l * (kv_lora + cfg.get('qk_rope_head_dim', 0)) * 2
+else:
+    kv_per_token = 2 * l * kv_heads * head_dim * 2
+
+# Reserved memory
+reserved = 1.5 + 0.5 * (experts > 0) + 0.3 * (kv_lora > 0)
+
+# Get NPU memory
+npu_mem = torch.npu.get_device_properties(0).total_memory / 1e9 if torch.npu.is_available() else 64
+usable = npu_mem * 0.88
+
+# Calculate TP requirement
+min_total = weights_gb + reserved + (kv_per_token * 8192) / 1e9
+tp_needed = max(1, math.ceil(min_total / usable))
+tp_size = 1
+while tp_size < tp_needed: tp_size *= 2
+
+print(f'Model: {h}h × {l}L | Weights: {weights_gb:.1f}GB')
+print(f'NPU: {npu_mem:.0f}GB | Reserved: {reserved:.1f}GB')
+print(f'Min Total: {min_total:.1f}GB | TP Required: {tp_size}')
+print(f'Heads/Device: {heads//tp_size} | KV Heads/Device: {kv_heads//tp_size}')
+
+# Validate
+if heads % tp_size != 0: print(f'ERROR: heads not divisible by TP={tp_size}')
+if kv_heads % tp_size != 0: print(f'ERROR: kv_heads not divisible by TP={tp_size}')
+heads_per_dev = heads // tp_size
+if heads_per_dev & (heads_per_dev - 1) != 0:
+    print(f'WARN: {heads_per_dev} heads/device not power-of-2, ACLGraph disabled')
+    print('RECOMMEND: --disable-cuda-graph')
+else:
+    print(f'ACLGraph: compatible')
+
+# Recommend mem_fraction
+mem_frac = round((usable - reserved/tp_size) / npu_mem, 3)
+print(f'RECOMMEND: --tp-size {tp_size} --mem-fraction-static {mem_frac}')
+" /models/<model>/config.json
 ```
 
-**Decision**: Single card if model < NPU memory × 0.9, else use TP.
+**Decision Rules**:
+| Condition | Action |
+|-----------|--------|
+| `weights_gb < npu_mem × 0.6` | Single card, `--mem-fraction-static 0.85` |
+| `weights_gb >= npu_mem × 0.6` | Calculate TP, verify head divisibility |
+| `heads_per_device not power-of-2` | Add `--disable-cuda-graph` |
+| `kv_heads % tp_size != 0` | Adjust TP to next power-of-2 |
+
+**Full reference**: [resource_assessment.md](./reference/resource_assessment.md)
 
 ### Step 3: Analyze Model
 
@@ -338,6 +401,7 @@ After implementing native fallback, create entry in `./<ModelName>_optimization_
 
 ## Quality Gate
 
+- [ ] **Resource assessment completed** (TP size, mem_fraction_static, ACLGraph compatibility verified)
 - [ ] Service starts from implementation roots
 - [ ] OpenAI-compatible inference succeeds (not startup-only)
 - [ ] **Accuracy validation passed** (minimum 3 tests: math, knowledge, logic)
@@ -354,11 +418,13 @@ See [common_pitfalls.md](./reference/common_pitfalls.md) for detailed explanatio
 
 | Pitfall | Quick Fix |
 |---------|-----------|
+| **OOM at startup** | Run resource assessment, adjust TP/mem_fraction |
 | CUDA code on NPU | Test NPU paths with real inputs |
 | Skipping accuracy test | Run 3-test suite (math/knowledge/logic) |
 | Modifying shared code | Use `is_npu()` guard |
 | Reasoning model truncation | `max_tokens >= 500` |
 | Non-power-of-2 heads | `--disable-cuda-graph` |
+| kv_heads not divisible by TP | Adjust TP to next power-of-2 |
 
 ## Completion Criteria
 
