@@ -38,18 +38,7 @@ Adapt Hugging Face or local models to run on `sglang` with minimal changes, dete
 
 ## Prerequisites
 
-**MUST verify before starting** (see [shared/npu_common_reference.md](../shared/npu_common_reference.md)):
-
-```bash
-# NPU available
-python -c "import torch; assert torch.npu.is_available()"
-
-# CANN version
-npu-smi info
-
-# SGLang installed
-python -c "import sglang"
-```
+**Assume environment ready.** Verify only on error. See [shared/npu_common_reference.md](../shared/npu_common_reference.md) for check commands.
 
 ## Hard Constraints
 
@@ -204,7 +193,7 @@ python -c "import json; c=json.load(open('/models/<model>/config.json')); print(
   - Register architecture in `registry.py`
   - Implement weight loading/remap rules
 
-### 4) Implement Minimal Changes
+### 5) Implement Minimal Changes
 
 - Touch only required files
 - Keep weight mapping explicit and auditable
@@ -249,7 +238,7 @@ python -m sglang.launch_server \
 - Weight key mapping correct
 - KV/QK norm sharding validated
 
-### 5.5) Accuracy Validation (MANDATORY)
+### 7) Accuracy Validation (MANDATORY)
 
 **Model loading successfully does NOT guarantee correct outputs.** Always run accuracy tests.
 
@@ -269,7 +258,7 @@ python -m sglang.launch_server \
 - For multimodal processor issues: use `--limit-mm-per-prompt` to isolate
 - Capacity baseline: `context-length=128k` + `max-running-requests=16`
 
-### 7) Generate Artifacts and Commit
+### 9) Generate Artifacts and Commit
 
 - Create `./<ModelName>.md` tutorial (Introduction, Features, Environment, Deployment, Verification, Accuracy, Performance)
 - Single signed commit with all changes
