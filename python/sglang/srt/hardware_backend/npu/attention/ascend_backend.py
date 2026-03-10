@@ -1031,6 +1031,7 @@ class AscendAttnBackend(AttentionBackend):
                 attn_output = attn_output.view(
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
+                return attn_output
 
             assert (
                 layer.qk_head_dim != layer.v_head_dim
