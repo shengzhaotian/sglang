@@ -212,6 +212,11 @@ python -c "import json; c=json.load(open('/models/<model>/config.json')); print(
 
 ### 5) Two-Stage Validation
 
+**Pre-flight: Clean residual processes**
+```bash
+pkill -f "sglang.launch_server" 2>/dev/null || true
+```
+
 #### Stage A: Dummy Fast Gate (Recommended First)
 
 ```bash
@@ -344,7 +349,7 @@ See [shared/npu_common_reference.md](../shared/npu_common_reference.md) for erro
 
 | Phase | Check |
 |-------|-------|
-| Before Start | Model path exists, NPU available, CANN version |
+| Before Start | Model path exists, NPU available, CANN version, **no residual sglang processes** |
 | Startup | PYTHONPATH set, `--attention-backend ascend`, `--device npu` |
 | Inference | `/v1/models` first, check attention path logs, verify KV Cache |
 | Performance | ACLGraph enabled, `--cuda-graph-bs` matches, HCCL logs |
