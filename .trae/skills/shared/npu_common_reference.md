@@ -14,22 +14,15 @@ pip install -e "python"
 
 ## Pre-flight Checks
 
-Before any NPU operation, verify environment:
+**Assume environment ready.** Verify only on error:
 
-```bash
-# NPU Hardware
-python -c "import torch; print(f'NPU available: {torch.npu.is_available()}')"
-python -c "import torch; print(f'Device count: {torch.npu.device_count()}')"
-
-# CANN Version
-npu-smi info
-
-# torch_npu Version
-python -c "import torch_npu; print(f'torch_npu: {torch_npu.__version__}')"
-
-# SGLang Installation
-python -c "import sglang; print(f'sglang: {sglang.__version__}')"
-```
+| Check | Command | Error Trigger |
+|-------|---------|---------------|
+| NPU available | `python -c "import torch; print(torch.npu.is_available())"` | Device errors |
+| Device count | `python -c "import torch; print(torch.npu.device_count())"` | TP/EP errors |
+| CANN version | `npu-smi info` | Communication errors |
+| torch_npu | `python -c "import torch_npu; print(torch_npu.__version__)"` | Import errors |
+| SGLang | `python -c "import sglang; print(sglang.__version__)"` | Import errors |
 
 ## Environment Variables Quick Reference
 

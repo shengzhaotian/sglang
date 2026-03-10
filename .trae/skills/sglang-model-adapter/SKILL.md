@@ -38,18 +38,15 @@ Adapt Hugging Face or local models to run on `sglang` with minimal changes, dete
 
 ## Prerequisites
 
-**MUST verify before starting** (see [shared/npu_common_reference.md](../shared/npu_common_reference.md)):
+**Assume environment is ready.** Only verify on error:
 
-```bash
-# NPU available
-python -c "import torch; assert torch.npu.is_available()"
+| Check | Command | When to Run |
+|-------|---------|-------------|
+| NPU available | `python -c "import torch; assert torch.npu.is_available()"` | Startup failure |
+| CANN version | `npu-smi info` | Communication errors |
+| SGLang installed | `python -c "import sglang"` | Import errors |
 
-# CANN version
-npu-smi info
-
-# SGLang installed
-python -c "import sglang"
-```
+**Full reference**: [shared/npu_common_reference.md](../shared/npu_common_reference.md)
 
 ## Hard Constraints
 
@@ -151,51 +148,37 @@ def forward(self, x):
 
 ## Execution Playbook
 
-### 1) Collect Context
+### Step 1: Collect Context
 
 - Confirm model path (default `/models/<model-name>`)
 - Confirm implementation roots (current project repo)
 - Confirm delivery root (current git repo)
 - Use default feature set: ACLGraph + DeepEP + MTP + multimodal (if VL)
 
-### 1.5) Resource & Parallel Strategy Assessment (MANDATORY PRE-FLIGHT)
+### Step 2: Resource Assessment (Conditional)
 
-**Execute before model loading to ensure deployment feasibility.**
-
-#### Quick Assessment
+**Skip if model fits single card.** Only assess when:
+- Model > 60GB parameters
+- TP size > 1 required
 
 ```bash
-# Hardware check
-python -c "import torch; [print(f'NPU {i}: {torch.npu.get_device_properties(i).total_memory/1e9:.1f}GB') for i in range(torch.npu.device_count())]"
-
-# Model config check  
-python -c "import json; c=json.load(open('/models/<model>/config.json')); print(f'Hidden:{c.get(\"hidden_size\")} Layers:{c.get(\"num_hidden_layers\")} Vocab:{c.get(\"vocab_size\")}')"
+# Quick check (run only if needed)
+python -c "import torch, json; \
+  mem = torch.npu.get_device_properties(0).total_memory/1e9; \
+  c = json.load(open('/models/<model>/config.json')); \
+  print(f'NPU: {mem:.0f}GB | Model: {c.get(\"hidden_size\")}h × {c.get(\"num_hidden_layers\")}L')"
 ```
 
-#### Decision Summary
+**Decision**: Single card if model < NPU memory × 0.9, else use TP.
 
-| Condition | Strategy | TP Size |
-|-----------|----------|---------|
-| Total ≤ Single Card × 0.9 | Single Card | 1 |
-| Total > Single Card × 0.9 | Tensor Parallel | min power-of-2 |
-| TP > Available NPUs | Infeasible | - |
-
-**Detailed implementation**: See [resource_assessment.md](./reference/resource_assessment.md) for memory estimation formulas and Python code.
-
-#### Assessment Checklist
-- [ ] Model memory requirements calculated
-- [ ] NPU resources detected  
-- [ ] Parallel strategy recommended (`feasible=True` required to proceed)
-- [ ] Risk documented if memory headroom < 20%
-
-### 2) Analyze Model
+### Step 3: Analyze Model
 
 - Inspect `config.json`, processor files, modeling files, tokenizer files
 - Identify architecture class, attention variant, quantization type
 - Check state-dict key prefixes for mapping needs
 - Check `python/sglang/srt/models/registry.py` for existing support
 
-### 3) Choose Adaptation Strategy
+### Step 4: Choose Adaptation Strategy
 
 - **Reuse**: If architecture exists in registry
 - **Implement**: If missing or incompatible:
@@ -204,13 +187,13 @@ python -c "import json; c=json.load(open('/models/<model>/config.json')); print(
   - Register architecture in `registry.py`
   - Implement weight loading/remap rules
 
-### 4) Implement Minimal Changes
+### Step 5: Implement Minimal Changes
 
 - Touch only required files
 - Keep weight mapping explicit and auditable
 - Avoid unrelated refactors
 
-### 5) Two-Stage Validation
+### Step 6: Two-Stage Validation
 
 **Pre-flight: Clean residual processes**
 ```bash
@@ -249,7 +232,7 @@ python -m sglang.launch_server \
 - Weight key mapping correct
 - KV/QK norm sharding validated
 
-### 5.5) Accuracy Validation (MANDATORY)
+#### Stage C: Accuracy Validation (MANDATORY)
 
 **Model loading successfully does NOT guarantee correct outputs.** Always run accuracy tests.
 
@@ -263,13 +246,13 @@ python -m sglang.launch_server \
 
 **Commands**: See [quick_start_commands.md](./reference/quick_start_commands.md)
 
-### 6) Validate Features
+### Step 7: Validate Features
 
 - Feature-first: EP + ACLGraph first; eager as fallback
 - For multimodal processor issues: use `--limit-mm-per-prompt` to isolate
 - Capacity baseline: `context-length=128k` + `max-running-requests=16`
 
-### 7) Generate Artifacts and Commit
+### Step 8: Generate Artifacts and Commit
 
 - Create `./<ModelName>.md` tutorial (Introduction, Features, Environment, Deployment, Verification, Accuracy, Performance)
 - Single signed commit with all changes
@@ -287,9 +270,7 @@ See [shared/npu_common_reference.md](../shared/npu_common_reference.md) for envi
 
 **Detailed commands**: See [quick_start_commands.md](./reference/quick_start_commands.md)
 
-## Adaptation Obstacle Auto-Resolution
-
-When encountering adaptation obstacles that consume excessive tokens, automatically implement native branch solutions as temporary workarounds, while recording bypassed technical points for future optimization.
+## Error Handling & Fallback
 
 ### Obstacle Detection Triggers
 
@@ -307,6 +288,17 @@ When encountering adaptation obstacles that consume excessive tokens, automatica
 Error → Attempts ≥ threshold? → Match obstacle pattern? → Implement native fallback → Record optimization task → Validate accuracy
 ```
 
+### Quick Fallback Commands
+
+```bash
+# Attention/Graph issues
+python -m sglang.launch_server --model-path /models/<model> --disable-cuda-graph --device npu --port 8000
+
+# MoE issues
+export SGLANG_NPU_USE_NATIVE_MOE=1
+python -m sglang.launch_server --model-path /models/<model> --attention-backend ascend --device npu --port 8000
+```
+
 ### Native Implementation Templates
 
 **Attention Fallback**:
@@ -321,35 +313,10 @@ def forward(self, q, k, v, ...):
 
 **MoE Fallback**: Use sequential expert computation instead of DeepEP when `SGLANG_NPU_USE_NATIVE_MOE=1`.
 
-### Quick Fallback Commands
-
-```bash
-# Attention/Graph issues
-python -m sglang.launch_server --model-path /models/<model> --disable-cuda-graph --device npu --port 8000
-
-# MoE issues
-export SGLANG_NPU_USE_NATIVE_MOE=1
-python -m sglang.launch_server --model-path /models/<model> --attention-backend ascend --device npu --port 8000
-```
-
-### Optimization Task Recording
-
-After implementing native fallback, create entry in `./<ModelName>_optimization_backlog.md`:
-- **Component**: attention/graph/moe/custom
-- **Issue**: brief description
-- **Fallback Used**: native_sdpa/disable_graph/native_moe
-- **Root Cause**: why optimized path failed
-- **Priority**: High/Medium/Low based on performance impact
-
-## Error Handling
-
-See [shared/npu_common_reference.md](../shared/npu_common_reference.md) for error code reference.
-
 ### Debug Checklist
 
-| Phase | Check |
-|-------|-------|
-| Before Start | Model path exists, NPU available, CANN version, **no residual sglang processes** |
+| Phase | Check (on error) |
+|-------|------------------|
 | Startup | PYTHONPATH set, `--attention-backend ascend`, `--device npu` |
 | Inference | `/v1/models` first, check attention path logs, verify KV Cache |
 | Performance | ACLGraph enabled, `--cuda-graph-bs` matches, HCCL logs |
@@ -359,6 +326,15 @@ See [shared/npu_common_reference.md](../shared/npu_common_reference.md) for erro
 **MoE Models**: `--ep-size`, `--moe-a2a-backend deepep`, DeepEP env vars
 **MLA Models**: `ASCEND_USE_FIA=1`, `SGLANG_NPU_USE_MLAPO=1`, check `kv_lora_rank`
 **Speculative**: Draft model path correct, `--speculative-num-steps` reasonable (3-8)
+
+### Optimization Task Recording
+
+After implementing native fallback, create entry in `./<ModelName>_optimization_backlog.md`:
+- **Component**: attention/graph/moe/custom
+- **Issue**: brief description
+- **Fallback Used**: native_sdpa/disable_graph/native_moe
+- **Root Cause**: why optimized path failed
+- **Priority**: High/Medium/Low based on performance impact
 
 ## Quality Gate
 
