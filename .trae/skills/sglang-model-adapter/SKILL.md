@@ -38,15 +38,18 @@ Adapt Hugging Face or local models to run on `sglang` with minimal changes, dete
 
 ## Prerequisites
 
-**Assume environment is ready.** Only verify on error:
+**MUST verify before starting** (see [shared/npu_common_reference.md](../shared/npu_common_reference.md)):
 
-| Check | Command | When to Run |
-|-------|---------|-------------|
-| NPU available | `python -c "import torch; assert torch.npu.is_available()"` | Startup failure |
-| CANN version | `npu-smi info` | Communication errors |
-| SGLang installed | `python -c "import sglang"` | Import errors |
+```bash
+# NPU available
+python -c "import torch; assert torch.npu.is_available()"
 
-**Full reference**: [shared/npu_common_reference.md](../shared/npu_common_reference.md)
+# CANN version
+npu-smi info
+
+# SGLang installed
+python -c "import sglang"
+```
 
 ## Hard Constraints
 
@@ -148,100 +151,51 @@ def forward(self, x):
 
 ## Execution Playbook
 
-### Step 1: Collect Context
+### 1) Collect Context
 
 - Confirm model path (default `/models/<model-name>`)
 - Confirm implementation roots (current project repo)
 - Confirm delivery root (current git repo)
 - Use default feature set: ACLGraph + DeepEP + MTP + multimodal (if VL)
 
-### Step 2: Resource Assessment (MANDATORY)
+### 1.5) Resource & Parallel Strategy Assessment (MANDATORY PRE-FLIGHT)
 
-**Always run memory assessment before launching server.** OOM during startup wastes time and may corrupt state.
+**Execute before model loading to ensure deployment feasibility.**
 
-```python
-# Run this assessment script
-python -c "
-import torch, json, math, sys
-path = sys.argv[1] if len(sys.argv) > 1 else '/models/<model>'
-if not path.endswith('.json'): path += '/config.json'
-cfg = json.load(open(path))
+#### Quick Assessment
 
-h = cfg.get('hidden_size', 0)
-l = cfg.get('num_hidden_layers', 0)
-v = cfg.get('vocab_size', 0)
-inter = cfg.get('intermediate_size', h * 4)
-heads = cfg.get('num_attention_heads', h)
-kv_heads = cfg.get('num_key_value_heads', heads)
-head_dim = cfg.get('head_dim', h // heads)
-experts = cfg.get('num_experts', 0)
+```bash
+# Hardware check
+python -c "import torch; [print(f'NPU {i}: {torch.npu.get_device_properties(i).total_memory/1e9:.1f}GB') for i in range(torch.npu.device_count())]"
 
-# Weight estimation
-embed = v * h * 2
-attn = l * (h * h + 2 * h * kv_heads * head_dim + kv_heads * head_dim * h) * 2
-mlp = l * 3 * h * inter * 2
-moe = l * experts * 3 * h * cfg.get('moe_intermediate_size', inter) * 2 if experts else 0
-weights_gb = (embed + attn + mlp + moe) / 1e9
-
-# KV cache per token
-kv_lora = cfg.get('kv_lora_rank', 0)
-if kv_lora > 0:
-    kv_per_token = l * (kv_lora + cfg.get('qk_rope_head_dim', 0)) * 2
-else:
-    kv_per_token = 2 * l * kv_heads * head_dim * 2
-
-# Reserved memory
-reserved = 1.5 + 0.5 * (experts > 0) + 0.3 * (kv_lora > 0)
-
-# Get NPU memory
-npu_mem = torch.npu.get_device_properties(0).total_memory / 1e9 if torch.npu.is_available() else 64
-usable = npu_mem * 0.88
-
-# Calculate TP requirement
-min_total = weights_gb + reserved + (kv_per_token * 8192) / 1e9
-tp_needed = max(1, math.ceil(min_total / usable))
-tp_size = 1
-while tp_size < tp_needed: tp_size *= 2
-
-print(f'Model: {h}h × {l}L | Weights: {weights_gb:.1f}GB')
-print(f'NPU: {npu_mem:.0f}GB | Reserved: {reserved:.1f}GB')
-print(f'Min Total: {min_total:.1f}GB | TP Required: {tp_size}')
-print(f'Heads/Device: {heads//tp_size} | KV Heads/Device: {kv_heads//tp_size}')
-
-# Validate
-if heads % tp_size != 0: print(f'ERROR: heads not divisible by TP={tp_size}')
-if kv_heads % tp_size != 0: print(f'ERROR: kv_heads not divisible by TP={tp_size}')
-heads_per_dev = heads // tp_size
-if heads_per_dev & (heads_per_dev - 1) != 0:
-    print(f'WARN: {heads_per_dev} heads/device not power-of-2, ACLGraph disabled')
-    print('RECOMMEND: --disable-cuda-graph')
-else:
-    print(f'ACLGraph: compatible')
-
-# Recommend mem_fraction
-mem_frac = round((usable - reserved/tp_size) / npu_mem, 3)
-print(f'RECOMMEND: --tp-size {tp_size} --mem-fraction-static {mem_frac}')
-" /models/<model>/config.json
+# Model config check  
+python -c "import json; c=json.load(open('/models/<model>/config.json')); print(f'Hidden:{c.get(\"hidden_size\")} Layers:{c.get(\"num_hidden_layers\")} Vocab:{c.get(\"vocab_size\")}')"
 ```
 
-**Decision Rules**:
-| Condition | Action |
-|-----------|--------|
-| `weights_gb < npu_mem × 0.6` | Single card, `--mem-fraction-static 0.85` |
-| `weights_gb >= npu_mem × 0.6` | Calculate TP, verify head divisibility |
-| `heads_per_device not power-of-2` | Add `--disable-cuda-graph` |
-| `kv_heads % tp_size != 0` | Adjust TP to next power-of-2 |
+#### Decision Summary
 
-**Full reference**: [resource_assessment.md](./reference/resource_assessment.md)
+| Condition | Strategy | TP Size |
+|-----------|----------|---------|
+| Total ≤ Single Card × 0.9 | Single Card | 1 |
+| Total > Single Card × 0.9 | Tensor Parallel | min power-of-2 |
+| TP > Available NPUs | Infeasible | - |
 
-### Step 3: Analyze Model
+**Detailed implementation**: See [resource_assessment.md](./reference/resource_assessment.md) for memory estimation formulas and Python code.
+
+#### Assessment Checklist
+- [ ] Model memory requirements calculated
+- [ ] NPU resources detected  
+- [ ] Parallel strategy recommended (`feasible=True` required to proceed)
+- [ ] Risk documented if memory headroom < 20%
+
+### 2) Analyze Model
 
 - Inspect `config.json`, processor files, modeling files, tokenizer files
 - Identify architecture class, attention variant, quantization type
 - Check state-dict key prefixes for mapping needs
 - Check `python/sglang/srt/models/registry.py` for existing support
 
-### Step 4: Choose Adaptation Strategy
+### 3) Choose Adaptation Strategy
 
 - **Reuse**: If architecture exists in registry
 - **Implement**: If missing or incompatible:
@@ -250,13 +204,13 @@ print(f'RECOMMEND: --tp-size {tp_size} --mem-fraction-static {mem_frac}')
   - Register architecture in `registry.py`
   - Implement weight loading/remap rules
 
-### Step 5: Implement Minimal Changes
+### 4) Implement Minimal Changes
 
 - Touch only required files
 - Keep weight mapping explicit and auditable
 - Avoid unrelated refactors
 
-### Step 6: Two-Stage Validation
+### 5) Two-Stage Validation
 
 **Pre-flight: Clean residual processes**
 ```bash
@@ -295,7 +249,7 @@ python -m sglang.launch_server \
 - Weight key mapping correct
 - KV/QK norm sharding validated
 
-#### Stage C: Accuracy Validation (MANDATORY)
+### 5.5) Accuracy Validation (MANDATORY)
 
 **Model loading successfully does NOT guarantee correct outputs.** Always run accuracy tests.
 
@@ -309,13 +263,13 @@ python -m sglang.launch_server \
 
 **Commands**: See [quick_start_commands.md](./reference/quick_start_commands.md)
 
-### Step 7: Validate Features
+### 6) Validate Features
 
 - Feature-first: EP + ACLGraph first; eager as fallback
 - For multimodal processor issues: use `--limit-mm-per-prompt` to isolate
 - Capacity baseline: `context-length=128k` + `max-running-requests=16`
 
-### Step 8: Generate Artifacts and Commit
+### 7) Generate Artifacts and Commit
 
 - Create `./<ModelName>.md` tutorial (Introduction, Features, Environment, Deployment, Verification, Accuracy, Performance)
 - Single signed commit with all changes
@@ -333,7 +287,9 @@ See [shared/npu_common_reference.md](../shared/npu_common_reference.md) for envi
 
 **Detailed commands**: See [quick_start_commands.md](./reference/quick_start_commands.md)
 
-## Error Handling & Fallback
+## Adaptation Obstacle Auto-Resolution
+
+When encountering adaptation obstacles that consume excessive tokens, automatically implement native branch solutions as temporary workarounds, while recording bypassed technical points for future optimization.
 
 ### Obstacle Detection Triggers
 
@@ -351,17 +307,6 @@ See [shared/npu_common_reference.md](../shared/npu_common_reference.md) for envi
 Error → Attempts ≥ threshold? → Match obstacle pattern? → Implement native fallback → Record optimization task → Validate accuracy
 ```
 
-### Quick Fallback Commands
-
-```bash
-# Attention/Graph issues
-python -m sglang.launch_server --model-path /models/<model> --disable-cuda-graph --device npu --port 8000
-
-# MoE issues
-export SGLANG_NPU_USE_NATIVE_MOE=1
-python -m sglang.launch_server --model-path /models/<model> --attention-backend ascend --device npu --port 8000
-```
-
 ### Native Implementation Templates
 
 **Attention Fallback**:
@@ -376,19 +321,16 @@ def forward(self, q, k, v, ...):
 
 **MoE Fallback**: Use sequential expert computation instead of DeepEP when `SGLANG_NPU_USE_NATIVE_MOE=1`.
 
-### Debug Checklist
+### Quick Fallback Commands
 
-| Phase | Check (on error) |
-|-------|------------------|
-| Startup | PYTHONPATH set, `--attention-backend ascend`, `--device npu` |
-| Inference | `/v1/models` first, check attention path logs, verify KV Cache |
-| Performance | ACLGraph enabled, `--cuda-graph-bs` matches, HCCL logs |
+```bash
+# Attention/Graph issues
+python -m sglang.launch_server --model-path /models/<model> --disable-cuda-graph --device npu --port 8000
 
-### Feature-Specific Checks
-
-**MoE Models**: `--ep-size`, `--moe-a2a-backend deepep`, DeepEP env vars
-**MLA Models**: `ASCEND_USE_FIA=1`, `SGLANG_NPU_USE_MLAPO=1`, check `kv_lora_rank`
-**Speculative**: Draft model path correct, `--speculative-num-steps` reasonable (3-8)
+# MoE issues
+export SGLANG_NPU_USE_NATIVE_MOE=1
+python -m sglang.launch_server --model-path /models/<model> --attention-backend ascend --device npu --port 8000
+```
 
 ### Optimization Task Recording
 
@@ -399,9 +341,27 @@ After implementing native fallback, create entry in `./<ModelName>_optimization_
 - **Root Cause**: why optimized path failed
 - **Priority**: High/Medium/Low based on performance impact
 
+## Error Handling
+
+See [shared/npu_common_reference.md](../shared/npu_common_reference.md) for error code reference.
+
+### Debug Checklist
+
+| Phase | Check |
+|-------|-------|
+| Before Start | Model path exists, NPU available, CANN version, **no residual sglang processes** |
+| Startup | PYTHONPATH set, `--attention-backend ascend`, `--device npu` |
+| Inference | `/v1/models` first, check attention path logs, verify KV Cache |
+| Performance | ACLGraph enabled, `--cuda-graph-bs` matches, HCCL logs |
+
+### Feature-Specific Checks
+
+**MoE Models**: `--ep-size`, `--moe-a2a-backend deepep`, DeepEP env vars
+**MLA Models**: `ASCEND_USE_FIA=1`, `SGLANG_NPU_USE_MLAPO=1`, check `kv_lora_rank`
+**Speculative**: Draft model path correct, `--speculative-num-steps` reasonable (3-8)
+
 ## Quality Gate
 
-- [ ] **Resource assessment completed** (TP size, mem_fraction_static, ACLGraph compatibility verified)
 - [ ] Service starts from implementation roots
 - [ ] OpenAI-compatible inference succeeds (not startup-only)
 - [ ] **Accuracy validation passed** (minimum 3 tests: math, knowledge, logic)
@@ -418,13 +378,11 @@ See [common_pitfalls.md](./reference/common_pitfalls.md) for detailed explanatio
 
 | Pitfall | Quick Fix |
 |---------|-----------|
-| **OOM at startup** | Run resource assessment, adjust TP/mem_fraction |
 | CUDA code on NPU | Test NPU paths with real inputs |
 | Skipping accuracy test | Run 3-test suite (math/knowledge/logic) |
 | Modifying shared code | Use `is_npu()` guard |
 | Reasoning model truncation | `max_tokens >= 500` |
 | Non-power-of-2 heads | `--disable-cuda-graph` |
-| kv_heads not divisible by TP | Adjust TP to next power-of-2 |
 
 ## Completion Criteria
 
