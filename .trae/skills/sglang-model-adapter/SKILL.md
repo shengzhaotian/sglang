@@ -24,6 +24,13 @@ Adapt Hugging Face or local models to run on `sglang` with minimal changes, dete
 - **Dummy-first is encouraged for speed, but dummy is NOT fully equivalent to real weights.**
 - **Never sign off adaptation using dummy-only evidence; real-weight gate is mandatory.**
 - **CUDA graph batch size optimization**: Use minimal `--cuda-graph-bs` values (e.g., `1 2 4 8`) to reduce capture time and memory overhead. Default large batch sizes can cause excessive capture time and OOM during graph capture phase.
+- **NPU process cleanup**: Before starting a new service launch and after service termination/error, clean up NPU processes to avoid residual processes affecting subsequent operations:
+  ```bash
+  # Kill all Python processes on NPU
+  pkill -9 python
+  # Or kill specific sglang processes
+  pkill -9 -f sglang
+  ```
 
 ## Execution playbook
 
