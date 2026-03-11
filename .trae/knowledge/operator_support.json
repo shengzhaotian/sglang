@@ -1,0 +1,33 @@
+{
+  "version": "1.0",
+  "last_updated": "2025-03-11",
+  "operators": {
+    "nn.Linear": {"a2": "native", "a3": "native"},
+    "nn.Embedding": {"a2": "native", "a3": "native"},
+    "nn.LayerNorm": {"a2": "native", "a3": "native"},
+    "nn.RMSNorm": {"a2": "native", "a3": "native"},
+    "attention.MHA": {"a2": "flash_attn", "a3": "flash_attn"},
+    "attention.GQA": {"a2": "flash_attn", "a3": "flash_attn"},
+    "attention.MLA": {"a2": "fallback", "a3": "native"},
+    "nn.SiLU": {"a2": "native", "a3": "native"},
+    "nn.GELU": {"a2": "native", "a3": "native"},
+    "nn.Softmax": {"a2": "native", "a3": "native"},
+    "rotary_embedding": {"a2": "native", "a3": "native"},
+    "moe.router": {"a2": "mc2", "a3": "mc2"},
+    "moe.experts": {"a2": "mc2", "a3": "mc2"},
+    "kv_cache": {"a2": "native", "a3": "native"},
+    "speculative_decoding": {"a2": "unsupported", "a3": "experimental"}
+  },
+  "attention_backends": {
+    "flash_attention_npu": {"a2": true, "a3": true},
+    "torch_attention": {"a2": true, "a3": true},
+    "triton_attention": {"a2": false, "a3": true}
+  },
+  "quantization": {
+    "W8A8_INT8": {"a2": true, "a3": true},
+    "W4A8_INT8": {"a2": "partial", "a3": true},
+    "W8A8_FP8": {"a2": false, "a3": true},
+    "BF16": {"a2": true, "a3": true},
+    "FP16": {"a2": true, "a3": true}
+  }
+}

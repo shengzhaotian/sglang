@@ -1,0 +1,49 @@
+{
+  "version": "1.0",
+  "description": "成功配置模板库",
+  "templates": [
+    {
+      "architecture": "Qwen",
+      "hardware": "A3",
+      "config": {
+        "quantization": "W8A8",
+        "tp_size": 8,
+        "attention_backend": "flash_attention_npu"
+      },
+      "performance": {
+        "ttft_ms": 150,
+        "tpot_ms": 20,
+        "throughput": 5000
+      }
+    },
+    {
+      "architecture": "Llama",
+      "hardware": "A3",
+      "config": {
+        "quantization": "W8A8",
+        "tp_size": 8,
+        "attention_backend": "flash_attention_npu"
+      },
+      "performance": {
+        "ttft_ms": 160,
+        "tpot_ms": 22,
+        "throughput": 4500
+      }
+    },
+    {
+      "architecture": "DeepSeek",
+      "hardware": "A3",
+      "config": {
+        "quantization": "W8A8",
+        "tp_size": 8,
+        "moe_backend": "mc2",
+        "attention_backend": "flash_attention_npu"
+      },
+      "performance": {
+        "ttft_ms": 180,
+        "tpot_ms": 25,
+        "throughput": 4000
+      }
+    }
+  ]
+}

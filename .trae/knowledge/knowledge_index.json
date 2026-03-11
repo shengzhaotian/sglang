@@ -1,0 +1,29 @@
+{
+  "knowledge_index": {
+    "npu-specs": {
+      "trigger_keywords": ["A2", "A3", "Atlas", "NPU", "硬件", "内存", "算力"],
+      "file": "npu-specs.md",
+      "size_tokens": 400
+    },
+    "sglang-api": {
+      "trigger_keywords": ["API", "接口", "注册", "backend", "attention", "量化"],
+      "file": "sglang-api-reference.md",
+      "size_tokens": 500
+    },
+    "best-practices": {
+      "trigger_keywords": ["最佳实践", "规范", "流程", "测试"],
+      "file": "model-adaptation-best-practices.md",
+      "size_tokens": 300
+    },
+    "troubleshooting": {
+      "trigger_keywords": ["错误", "问题", "失败", "排查", "OOM"],
+      "file": "troubleshooting.md",
+      "size_tokens": 300
+    },
+    "operator-support": {
+      "trigger_keywords": ["算子", "operator", "支持", "兼容", "attention", "量化"],
+      "file": "operator_support.json",
+      "size_tokens": 600
+    }
+  }
+}

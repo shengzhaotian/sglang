@@ -1,0 +1,24 @@
+{
+  "version": "1.0",
+  "description": "常见问题模式库",
+  "patterns": [
+    {
+      "id": "unsupported_operator",
+      "symptoms": ["Operator XXX not supported", "RuntimeError: not implemented"],
+      "solutions": ["使用fallback实现", "联系开发团队", "等效算子替换"],
+      "affected_architectures": []
+    },
+    {
+      "id": "oom_error",
+      "symptoms": ["Out of memory", "OOM", "memory allocation failed"],
+      "solutions": ["降低mem_fraction_static", "减小max_num_seqs", "增加TP size"],
+      "affected_architectures": []
+    },
+    {
+      "id": "precision_loss",
+      "symptoms": ["输出质量下降", "乱码", "精度损失超过阈值"],
+      "solutions": ["检查量化配置", "验证权重加载", "对比参考输出"],
+      "affected_architectures": []
+    }
+  ]
+}
