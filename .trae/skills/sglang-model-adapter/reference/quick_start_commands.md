@@ -7,7 +7,7 @@ export PYTHONPATH=${PWD}/python:$PYTHONPATH
 python -m sglang.launch_server \
     --model-path /models/<model> --tp-size <tp> \
     --attention-backend ascend --device npu \
-    --port 8000 --cuda-graph-bs 8 16 24 32
+    --port 8000 --cuda-graph-bs 1 2 4 8
 ```
 
 ## MLA Model (DeepSeek-V2/V3)
@@ -19,7 +19,7 @@ export ASCEND_USE_FIA=1 SGLANG_NPU_USE_MLAPO=1 SGLANG_USE_FIA_NZ=1
 python -m sglang.launch_server \
     --model-path /models/deepseek-v3 --tp-size 16 \
     --enable-dp-attention --attention-backend ascend --device npu \
-    --quantization modelslim --cuda-graph-bs 8 16 24 32
+    --quantization modelslim --cuda-graph-bs 1 2 4 8
 ```
 
 ## MoE with DeepEP

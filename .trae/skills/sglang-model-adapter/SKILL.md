@@ -23,6 +23,7 @@ Adapt Hugging Face or local models to run on `sglang` with minimal changes, dete
 - Keep final docs in Chinese and compact.
 - **Dummy-first is encouraged for speed, but dummy is NOT fully equivalent to real weights.**
 - **Never sign off adaptation using dummy-only evidence; real-weight gate is mandatory.**
+- **CUDA graph batch size optimization**: Use minimal `--cuda-graph-bs` values (e.g., `1 2 4 8`) to reduce capture time and memory overhead. Default large batch sizes can cause excessive capture time and OOM during graph capture phase.
 
 ## Execution playbook
 
@@ -230,7 +231,7 @@ Adapt Hugging Face or local models to run on `sglang` with minimal changes, dete
 - OpenAI-compatible inference request succeeds (not startup-only).
 - **Accuracy validation completed**: curl commands executed, responses recorded, pass/fail assessed.
 - Key feature set is attempted and reported: ACLGraph / DeepEP / MTP / multimodal.
-- Capacity baseline (`128k + bs16`) result is reported, or explicit reason why not feasible.
+- Capacity baseline (`32k + bs2`) result is reported, or explicit reason why not feasible.
 - **Dummy stage evidence is present (if used), and real-weight stage evidence is present (mandatory).**
 - Tutorial doc exists at `./<ModelName>.md` and follows the standard template (Introduction, Supported Features, Environment Preparation, Deployment, Functional Verification, Accuracy Evaluation, Performance).
 - Exactly one signed commit contains all code changes in current working repo.
