@@ -24,6 +24,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -251,6 +252,18 @@ class AscendAttnBackend(AttentionBackend):
         )
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
+
+        # head num padding
+        self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
+        self.q_head_num_padding = None
+        if hasattr(model_runner.model_config, "num_attention_heads"):
+            self.tp_q_head_num = (
+                model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            )
+            for num in self.padding_size_list:
+                if num >= self.tp_q_head_num:
+                    self.q_head_num_padding = num
+                    break
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
@@ -1405,6 +1418,16 @@ class AscendAttnBackend(AttentionBackend):
             q_nope = q.view(-1, 1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
             q_rope = q_rope.view(-1, 1, layer.tp_q_head_num, self.qk_rope_head_dim)
 
+            assert (
+                self.q_head_num_padding is None
+                or self.q_head_num_padding >= layer.tp_q_head_num
+            )
+
+            if self.q_head_num_padding > layer.tp_q_head_num:
+                padding_size = self.q_head_num_padding - layer.tp_q_head_num
+                q_nope = torch.nn.functional.pad(q_nope, (0, 0, 0, padding_size))
+                q_rope = torch.nn.functional.pad(q_rope, (0, 0, 0, padding_size))
+
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
             else:
@@ -1418,7 +1441,7 @@ class AscendAttnBackend(AttentionBackend):
                 c_kv_cache,
                 query_rope=q_rope,
                 key_rope=k_rope_cache,
-                num_heads=layer.tp_q_head_num,
+                num_heads=self.q_head_num_padding,
                 num_key_value_heads=layer.tp_k_head_num,
                 block_table=self.forward_metadata.block_tables,
                 block_size=self.page_size,
@@ -1438,7 +1461,7 @@ class AscendAttnBackend(AttentionBackend):
                 c_kv_cache,
                 query_rope=q_rope,
                 key_rope=k_rope_cache,
-                num_heads=layer.tp_q_head_num,
+                num_heads=self.q_head_num_padding,
                 num_key_value_heads=layer.tp_k_head_num,
                 block_table=self.forward_metadata.block_tables,
                 block_size=self.page_size,
@@ -1451,6 +1474,8 @@ class AscendAttnBackend(AttentionBackend):
                 workspace=workspace,
                 out=[output, softmax_lse],
             )
+
+            output = output[:, :, : layer.tp_q_head_num, :]
             return output.view(-1, layer.tp_q_head_num * self.kv_lora_rank)
 
     def forward_decode(
