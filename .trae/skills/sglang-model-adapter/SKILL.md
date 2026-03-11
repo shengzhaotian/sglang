@@ -49,9 +49,11 @@ Adapt Hugging Face or local models to run on `sglang` with minimal changes, dete
 - Check state-dict key prefixes (and safetensors index) to infer mapping needs.
 - Decide whether support already exists in `python/sglang/srt/models/registry.py`.
 
-### 3) Memory and configuration pre-check (CRITICAL)
+### 3) Memory and configuration pre-check (CRITICAL) - EXECUTE ONCE
 
 **Goal: Avoid invalid startup attempts by validating memory requirements before model launch.**
+
+**IMPORTANT: Memory calculation is performed ONCE in this step. Results are cached and reused throughout the entire skill execution. Do NOT recalculate in subsequent steps.**
 
 - Calculate model weight memory footprint:
     - Parse `config.json` to get: `hidden_size` (H), `num_hidden_layers` (L), `intermediate_size` (H'), `vocab_size` (V), `num_attention_heads`, `num_key_value_heads`.
@@ -99,13 +101,16 @@ Adapt Hugging Face or local models to run on `sglang` with minimal changes, dete
         - Calculate minimum required TP size: `ceil(total_memory / effective_hbm)`.
         - **MUST NOT attempt tp=1 launch**; skip to recommended TP configuration.
         - Log memory analysis and TP recommendation in the report.
-- Generate configuration report:
-    - Model parameter count (billions).
-    - Model weight size (GB).
-    - KV cache size per token (bytes) and total for target context (GB).
-    - NPU base overhead (~3GB) and activation overhead.
-    - Total memory requirement vs effective HBM (HBM - NPU base overhead).
-    - Recommended TP size with justification.
+- **Cache the following results for reuse**:
+    - `memory_report.params` - Model parameter count (billions)
+    - `memory_report.weight_gb` - Model weight size (GB)
+    - `memory_report.kv_cache_per_token_bytes` - KV cache per token (bytes)
+    - `memory_report.kv_cache_total_gb` - Total KV cache for target context (GB)
+    - `memory_report.npu_base_overhead_gb` - NPU base overhead (~3GB)
+    - `memory_report.activation_overhead_gb` - Activation overhead
+    - `memory_report.total_memory_gb` - Total memory requirement
+    - `memory_report.effective_hbm_gb` - Effective HBM (HBM - NPU base overhead)
+    - `memory_report.recommended_tp` - Recommended TP size with justification
 - **Gate condition**: If memory validation fails (insufficient HBM for tp=1), explicitly warn user and provide correct TP configuration before proceeding to Stage A.
 - **Validation example** (LLaMA-7B, FP16, context=8k, bs=8):
     - Params: 2×32000×4096 + 4096 + 32×(4×4096² + 3×4096×11008 + 2×4096) ≈ 6.74B
@@ -165,8 +170,10 @@ Adapt Hugging Face or local models to run on `sglang` with minimal changes, dete
 - Try feature-first validation: EP + ACLGraph path first; eager path as fallback/isolation.
 - If startup succeeds but first request crashes (false-ready), treat as runtime failure and continue root-cause isolation.
 - For multimodal processor API mismatch (for example `skip_tensor_conversion` signature mismatch), use text-only isolation (`--limit-mm-per-prompt` set image/video/audio to 0) to separate processor issues from core weight loading issues.
-- Capacity baseline by default (single machine): `context-length=8k` + `max-running-request=8`.
-- Then expand concurrency (e.g., 32/64) if requested or feasible.
+- **Capacity baseline**: Use cached `memory_report` from Step 3. Do NOT recalculate.
+    - Reference: `memory_report.recommended_tp` for TP configuration.
+    - Default baseline: `context-length=8k` + `max-running-request=8`.
+    - Expand concurrency (e.g., 16/32) only if `memory_report.total_memory_gb` allows.
 
 ### 8) Accuracy validation via API (MANDATORY for real-weight gate)
 
@@ -237,13 +244,13 @@ Adapt Hugging Face or local models to run on `sglang` with minimal changes, dete
 
 ## Quality gate before final answer
 
-- **Memory pre-check report exists** with model weight size, KV cache estimate, and TP recommendation.
-- **Configuration validated**: TP size matches memory requirement (no tp=1 attempt when insufficient HBM).
+- **Memory pre-check report cached**: `memory_report` object exists with all required fields (params, weight_gb, kv_cache_total_gb, recommended_tp, etc.).
+- **Configuration validated**: TP size matches `memory_report.recommended_tp` (no tp=1 attempt when insufficient HBM).
 - Service starts successfully from implementation roots with direct command.
 - OpenAI-compatible inference request succeeds (not startup-only).
 - **Accuracy validation completed**: curl commands executed, responses recorded, pass/fail assessed.
 - Key feature set is attempted and reported: ACLGraph / DeepEP / MTP / multimodal.
-- Capacity baseline (`32k + bs2`) result is reported, or explicit reason why not feasible.
+- Capacity baseline uses cached `memory_report` values (no recalculation).
 - **Dummy stage evidence is present (if used), and real-weight stage evidence is present (mandatory).**
 - Tutorial doc exists at `./<ModelName>.md` and follows the standard template (Introduction, Supported Features, Environment Preparation, Deployment, Functional Verification, Accuracy Evaluation, Performance).
 - Exactly one signed commit contains all code changes in current working repo.
