@@ -80,8 +80,8 @@ Adapt Hugging Face or local models to run on `sglang` with minimal changes, dete
       kv_cache_total = kv_cache_per_token * context_length * max_running_requests
       kv_cache_GB = kv_cache_total / (1024³)
       ```
-    - Default context length: 128k for baseline, adjust based on model config.
-    - Default max_running_requests: 16.
+    - Default context length: 8k for baseline, adjust based on model config.
+    - Default max_running_requests: 2.
 - Validate against single-card HBM capacity:
     - Get NPU HBM size (e.g., Ascend 910B: 64GB, Ascend 910A: 32GB).
     - Account for activation overhead (~5-8GB for typical inference).
@@ -153,7 +153,7 @@ Adapt Hugging Face or local models to run on `sglang` with minimal changes, dete
 - Try feature-first validation: EP + ACLGraph path first; eager path as fallback/isolation.
 - If startup succeeds but first request crashes (false-ready), treat as runtime failure and continue root-cause isolation.
 - For multimodal processor API mismatch (for example `skip_tensor_conversion` signature mismatch), use text-only isolation (`--limit-mm-per-prompt` set image/video/audio to 0) to separate processor issues from core weight loading issues.
-- Capacity baseline by default (single machine): `context-length=128k` + `max-running-request=16`.
+- Capacity baseline by default (single machine): `context-length=8k` + `max-running-request=2`.
 - Then expand concurrency (e.g., 32/64) if requested or feasible.
 
 ### 8) Accuracy validation via API (MANDATORY for real-weight gate)
