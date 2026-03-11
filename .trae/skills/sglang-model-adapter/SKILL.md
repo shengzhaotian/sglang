@@ -81,27 +81,32 @@ Adapt Hugging Face or local models to run on `sglang` with minimal changes, dete
       kv_cache_GB = kv_cache_total / (1024³)
       ```
     - Default context length: 8k for baseline, adjust based on model config.
-    - Default max_running_requests: 2.
+    - Default max_running_requests: 8.
 - Validate against single-card HBM capacity:
     - Get NPU HBM size (e.g., Ascend 910B: 64GB, Ascend 910A: 32GB).
-    - Account for activation overhead (~5-8GB for typical inference).
-    - Total memory required: `model_weights + kv_cache + activation_overhead`.
-    - If `total_memory > single_card_hbm`:
-        - Calculate minimum required TP size: `ceil(total_memory / single_card_hbm)`.
+    - **NPU base memory overhead**: ~3GB reserved for NPU runtime/driver (fixed overhead, always present).
+    - Activation overhead: ~5-8GB for typical inference (varies by model and batch size).
+    - Total memory required: `model_weights + kv_cache + npu_base_overhead + activation_overhead`.
+    - Effective available HBM: `single_card_hbm - npu_base_overhead` (e.g., 64GB - 3GB = 61GB usable).
+    - If `total_memory > effective_hbm`:
+        - Calculate minimum required TP size: `ceil(total_memory / effective_hbm)`.
         - **MUST NOT attempt tp=1 launch**; skip to recommended TP configuration.
         - Log memory analysis and TP recommendation in the report.
 - Generate configuration report:
     - Model parameter count (billions).
     - Model weight size (GB).
     - KV cache size per token (bytes) and total for target context (GB).
-    - Total memory requirement vs available HBM.
+    - NPU base overhead (~3GB) and activation overhead.
+    - Total memory requirement vs effective HBM (HBM - NPU base overhead).
     - Recommended TP size with justification.
 - **Gate condition**: If memory validation fails (insufficient HBM for tp=1), explicitly warn user and provide correct TP configuration before proceeding to Stage A.
-- **Validation example** (LLaMA-7B, FP16, context=128k, bs=16):
+- **Validation example** (LLaMA-7B, FP16, context=8k, bs=8):
     - Params: 2×32000×4096 + 4096 + 32×(4×4096² + 3×4096×11008 + 2×4096) ≈ 6.74B
     - Weights: 6.74B × 2 bytes ≈ 12.5 GB
-    - KV cache: 2×32×32×128×131072×16×2 ≈ 32 GB (GQA with 8 kv_heads reduces to ~8 GB)
-    - Total: ~12.5 + 8 + 6 ≈ 26.5 GB (fits in 32GB HBM with tp=1)
+    - KV cache (GQA, 8 kv_heads): 2×32×8×128×8192×8×2 ≈ 1 GB
+    - NPU base overhead: ~3 GB
+    - Activation overhead: ~5 GB
+    - Total: ~12.5 + 1 + 3 + 5 ≈ 21.5 GB (fits in 32GB HBM with tp=1, effective 29GB)
 
 ### 4) Choose adaptation strategy (new-model capable)
 
@@ -153,7 +158,7 @@ Adapt Hugging Face or local models to run on `sglang` with minimal changes, dete
 - Try feature-first validation: EP + ACLGraph path first; eager path as fallback/isolation.
 - If startup succeeds but first request crashes (false-ready), treat as runtime failure and continue root-cause isolation.
 - For multimodal processor API mismatch (for example `skip_tensor_conversion` signature mismatch), use text-only isolation (`--limit-mm-per-prompt` set image/video/audio to 0) to separate processor issues from core weight loading issues.
-- Capacity baseline by default (single machine): `context-length=8k` + `max-running-request=2`.
+- Capacity baseline by default (single machine): `context-length=8k` + `max-running-request=8`.
 - Then expand concurrency (e.g., 32/64) if requested or feasible.
 
 ### 8) Accuracy validation via API (MANDATORY for real-weight gate)
