@@ -2,6 +2,14 @@
 
 Shared reference for NPU-related skills. Both `sglang-model-adapter` and `npu-testing-workflow` reference this file.
 
+## Hard Constraints
+
+- **Never modify system environment** (e.g., `apt install`, `pip install`, system config changes) without explicit user approval.
+- **Always set PYTHONPATH to current project repo** when launching sglang services:
+  ```bash
+  export PYTHONPATH=${PWD}/python:$PYTHONPATH
+  ```
+
 ## Installation
 
 ```bash
@@ -137,6 +145,9 @@ pip install -e "python"
 ## NPU Test Commands
 
 ```bash
+# Set PYTHONPATH first
+export PYTHONPATH=${PWD}/python:$PYTHONPATH
+
 # Run NPU-specific tests
 python3 test/srt/test_srt_endpoint.py --device npu
 

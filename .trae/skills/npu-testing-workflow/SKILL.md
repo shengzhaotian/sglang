@@ -9,6 +9,17 @@ description: "Use when testing models on Ascend NPU devices, performing NPU-rela
 
 Systematic NPU testing workflow for service deployment, client benchmarking, and test report generation on Ascend devices.
 
+## Hard Constraints
+
+- **Never modify system environment** (e.g., `apt install`, `pip install`, system config changes) without explicit user approval.
+- **Always set PYTHONPATH to current project repo** when launching sglang services:
+  ```bash
+  export PYTHONPATH=${PWD}/python:$PYTHONPATH
+  ```
+- Primary implementation roots are current project repo.
+- Default API port is `8000` unless user explicitly asks otherwise.
+- Keep test reports in Chinese and compact.
+
 ## Input/Output Specification
 
 ### Required Inputs
@@ -78,9 +89,15 @@ export HCCL_SOCKET_IFNAME=lo
 
 ### Deployment Modes
 
+**IMPORTANT**: Always set PYTHONPATH before launching any sglang service:
+```bash
+export PYTHONPATH=${PWD}/python:$PYTHONPATH
+```
+
 #### PD Mixed Mode (Single Instance)
 
 ```bash
+export PYTHONPATH=${PWD}/python:$PYTHONPATH
 python -m sglang.launch_server \
     --model-path ${MODEL_PATH} \
     --tp-size 16 --attention-backend ascend --device npu \
@@ -93,6 +110,7 @@ python -m sglang.launch_server \
 
 **Prefill Server**:
 ```bash
+export PYTHONPATH=${PWD}/python:$PYTHONPATH
 export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:PORT"
 python -m sglang.launch_server \
     --model-path ${MODEL_PATH} \
@@ -104,6 +122,7 @@ python -m sglang.launch_server \
 
 **Decode Server**:
 ```bash
+export PYTHONPATH=${PWD}/python:$PYTHONPATH
 export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:PORT"
 python -m sglang.launch_server \
     --model-path ${MODEL_PATH} \
@@ -116,6 +135,7 @@ python -m sglang.launch_server \
 
 **Router**:
 ```bash
+export PYTHONPATH=${PWD}/python:$PYTHONPATH
 python -m sglang_router.launch_router \
     --pd-disaggregation --policy cache_aware \
     --prefill http://PREFILL_IP:8000 8995 \

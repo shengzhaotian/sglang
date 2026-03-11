@@ -2,6 +2,14 @@
 
 Quick reference for common NPU testing configurations. For complete reference, see [shared/npu_common_reference.md](../shared/npu_common_reference.md).
 
+## Hard Constraints
+
+- **Never modify system environment** (e.g., `apt install`, `pip install`, system config changes) without explicit user approval.
+- **Always set PYTHONPATH before launching sglang services**:
+  ```bash
+  export PYTHONPATH=${PWD}/python:$PYTHONPATH
+  ```
+
 ## Hardware Reference
 
 | Hardware | Devices | Memory | Best For |
@@ -15,6 +23,7 @@ Quick reference for common NPU testing configurations. For complete reference, s
 
 #### Low Latency (20ms TPOT) - 32 Cards Separation
 ```bash
+export PYTHONPATH=${PWD}/python:$PYTHONPATH
 export HCCL_BUFFSIZE=650
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=78
 
@@ -24,6 +33,7 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=78
 
 #### High Throughput (50ms TPOT) - 8 Cards Mixed
 ```bash
+export PYTHONPATH=${PWD}/python:$PYTHONPATH
 export HCCL_BUFFSIZE=1600
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
 
@@ -34,6 +44,7 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
 
 #### Low Latency (11-18ms TPOT) - 4 Cards
 ```bash
+export PYTHONPATH=${PWD}/python:$PYTHONPATH
 export HCCL_BUFFSIZE=400
 export HCCL_OP_EXPANSION_MODE=AIV
 
@@ -42,12 +53,14 @@ export HCCL_OP_EXPANSION_MODE=AIV
 
 #### High Throughput (50ms TPOT) - 2 Cards
 ```bash
+export PYTHONPATH=${PWD}/python:$PYTHONPATH
 # --tp-size 4 --quantization modelslim --cuda-graph-bs 16 32 64 68 72 78 --speculative-algorithm EAGLE3
 ```
 
 ### Qwen3-235B-A22B (MoE)
 
 ```bash
+export PYTHONPATH=${PWD}/python:$PYTHONPATH
 export HCCL_BUFFSIZE=1600
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
 
@@ -77,16 +90,19 @@ See [shared/npu_common_reference.md](../shared/npu_common_reference.md) for comp
 ### Performance Testing
 ```bash
 # Standard
+export PYTHONPATH=${PWD}/python:$PYTHONPATH
 python -m sglang.bench_serving --dataset-name random --backend sglang \
     --host 127.0.0.1 --port 6688 --num-prompts 1024 \
     --random-input-len 3500 --random-output-len 1500 --max-concurrency 256
 
 # Low latency
+export PYTHONPATH=${PWD}/python:$PYTHONPATH
 python -m sglang.bench_serving --dataset-name random --backend sglang \
     --host 127.0.0.1 --port 6688 --num-prompts 32 \
     --random-input-len 6000 --random-output-len 1600 --max-concurrency 32
 
 # High throughput
+export PYTHONPATH=${PWD}/python:$PYTHONPATH
 python -m sglang.bench_serving --dataset-name random --backend sglang \
     --host 127.0.0.1 --port 6688 --num-prompts 3072 \
     --random-input-len 3500 --random-output-len 1500 --max-concurrency 768 --request-rate 16
