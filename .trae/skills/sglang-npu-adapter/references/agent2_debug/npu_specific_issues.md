@@ -68,23 +68,34 @@ torch_npu.npu.synchronize()
 
 ---
 
-## 3. 性能调优
+## 3. NPU已知限制
 
-### 3.1 Attention后端选择
+### 3.1 限制列表
+
+| 限制ID | 类别 | 描述 | 错误模式 | 解决方案 |
+|--------|------|------|----------|----------|
+| L001 | graph | NPU使用NPU Graph，非CUDA Graph | cuda_graph_runner, Capture cuda graph | 使用 --disable-cuda-graph 或检查NPU Graph兼容性 |
+| L002 | operator | 部分算子不支持NPU Graph capture | operator not supported, graph capture failed | 禁用graph或寻找替代实现 |
+| L003 | memory | 长上下文对KV Cache内存压力大 | out of memory, OOM | 减小context_length或使用MLA压缩 |
+| L004 | parallel | EP配置必须满足约束 | ZeroDivisionError, expert distribution | 确保满足 tp_size % ep_size == 0 和 n_experts % ep_size == 0 |
+
+## 4. 性能调优
+
+### 4.1 Attention后端选择
 
 NPU使用 `ascend` 后端：
 ```bash
 --attention-backend ascend
 ```
 
-### 3.2 MoE实现选择
+### 4.2 MoE实现选择
 
 | 实现 | 适用场景 |
 |------|----------|
 | FusedMoE | 单卡或小规模EP |
 | DeepEP | 大规模EP（需HCCL） |
 
-### 3.3 通信优化
+### 4.3 通信优化
 
 ```bash
 # HCCL配置
@@ -95,7 +106,7 @@ export HCCL_BUFFSIZE=120
 
 ---
 
-## 4. 常见错误案例
+## 5. 常见错误案例
 
 ### 案例1：Ascend后端初始化失败
 
@@ -144,9 +155,9 @@ RuntimeError: NPU out of memory
 
 ---
 
-## 5. 环境检查
+## 6. 环境检查
 
-### 5.1 检查NPU设备
+### 6.1 检查NPU设备
 
 ```bash
 # 查看NPU信息
@@ -156,7 +167,7 @@ npu-smi info
 npu-smi info -l
 ```
 
-### 5.2 检查软件环境
+### 6.2 检查软件环境
 
 ```bash
 # 检查CANN
@@ -166,7 +177,7 @@ cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg
 python -c "import torch_npu; print(torch_npu.__version__)"
 ```
 
-### 5.3 检查通信
+### 6.3 检查通信
 
 ```bash
 # 检查HCCL
@@ -175,7 +186,7 @@ python -c "import torch.distributed as dist; dist.init_process_group(backend='hc
 
 ---
 
-## 6. 参考资源
+## 7. 参考资源
 
 | 资源 | 说明 |
 |------|------|

@@ -1,6 +1,20 @@
 # 常见错误及解决方案
 
-## 1. 错误分类概览
+## 1. 错误模式快速参考
+
+### 1.1 错误模式库
+
+| 错误ID | 关键词 | 错误类型 | 类别 | 诊断 | 根本原因 | 解决方向 |
+|--------|--------|----------|------|------|----------|----------|
+| E001 | cuda_graph_runner, Capture npu graph | npu_graph_error | hardware | NPU Graph捕获失败 | 算子不支持graph capture或动态shape问题 | 检查算子兼容性，考虑禁用graph |
+| E002 | ZeroDivisionError, integer division or modulo by zero | parallel_config_error | config | 并行配置约束不满足 | TP/EP配置不满足整除约束 | 重新计算TP/EP满足tp_size % ep_size == 0 |
+| E003 | KeyError, model_type | config_load_error | config | transformers不识别模型类型 | 模型配置未注册到transformers | 创建自定义配置类并注册到_CONFIG_REGISTRY |
+| E004 | out of memory, OOM, CUDA out of memory | memory_error | resource | 内存不足 | 权重或KV Cache超出设备内存 | 减小context_length、batch_size或增加设备数 |
+| E005 | device count, RuntimeError: device | device_error | hardware | 设备数量问题 | 配置的设备数超过可用设备数 | 减少TP/PP或检查设备可用性 |
+| E006 | operator not supported, not implemented | operator_error | hardware | 算子不支持 | NPU不支持该算子 | 寻找替代实现或绕过方案 |
+| E007 | ACL error, ASCEND error | npu_driver_error | hardware | NPU驱动错误 | NPU底层驱动或硬件问题 | 检查驱动版本、设备状态、内存清理 |
+
+## 2. 错误分类概览
 
 模型适配过程中的错误可分为以下几类：
 

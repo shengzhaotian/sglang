@@ -12,6 +12,25 @@ Embedding层 → [Decoder Layer × N] → LayerNorm → LM Head
                   └── LayerNorm × 2
 ```
 
+### 1.1 架构类型分类
+
+| 架构类型 | 描述 | 示例 | 需要EP | 并行策略 | 配置字段 |
+|----------|------|------|--------|----------|----------|
+| Dense | 标准稠密模型 | LlamaForCausalLM, Qwen2ForCausalLM | 否 | TP only | - |
+| MoE | 混合专家模型 | MixtralForCausalLM, DeepseekV2ForCausalLM | 是 | TP + EP | n_routed_experts, n_shared_experts, num_experts_per_tok |
+| MoE-MLA | 混合专家 + MLA注意力 | Glm4MoeLiteForCausalLM, DeepseekV2ForCausalLM | 是 | TP + EP | n_routed_experts, q_lora_rank, kv_lora_rank |
+| VLM | 视觉语言模型 | Qwen2VLForConditionalGeneration, LlavaForConditionalGeneration | 否 | TP | --chat-template |
+
+### 1.2 SGLang已支持模型
+
+| 模型名称 | 文件 | 类型 | NPU兼容 | 注意力后端 |
+|----------|------|------|----------|----------|
+| Glm4MoeLiteForCausalLM | glm4_moe_lite.py | MoE-MLA | 是 | ascend |
+| Glm4MoeForCausalLM | glm4_moe.py | MoE-MLA | 是 | ascend |
+| DeepseekV2ForCausalLM | deepseek_v2.py | MoE-MLA | 是 | ascend |
+| MixtralForCausalLM | mixtral.py | MoE | 是 | - |
+| LlamaForCausalLM | llama.py | Dense | 是 | - |
+
 ### 核心设计理念
 - **自回归生成**：模型逐token预测下一个token
 - **因果注意力**：每个位置只能看到之前位置的信息
@@ -241,7 +260,45 @@ HuggingFace和SGLang的rope_scaling格式可能不同：
 
 ---
 
-## 8. 参考代码
+## 8. 并行配置规则
+
+### 8.1 并行维度定义
+
+| 维度 | 名称 | 默认值 | 描述 | 约束 | 适用模型 |
+|------|------|--------|------|------|----------|
+| TP | Tensor Parallel | 1 | 将模型权重切分到多个设备 | `tp_size <= device_count`, `tp_size % ep_size == 0` | 所有模型 |
+| EP | Expert Parallel | 1 | 将MoE专家切分到多个设备 | `ep_size <= tp_size`, `n_routed_experts % ep_size == 0` | MoE, MoE-MLA |
+| PP | Pipeline Parallel | 1 | 将模型层切分到多个设备 | `tp_size * pp_size <= device_count` | 所有模型 |
+| DP | Data Parallel | 1 | 数据并行，自动计算 | 自动计算 | 所有模型 |
+
+### 8.2 核心约束
+
+| 约束 | 公式 | 错误信息 | 适用模型 |
+|------|------|----------|----------|
+| 设备数量 | `tp_size * pp_size <= device_count` | 设备数量不足 | 所有模型 |
+| TP/EP整除 | `tp_size % ep_size == 0` | TP必须能被EP整除 | 所有模型 |
+| 专家分布 | `n_routed_experts % ep_size == 0` | 专家数必须能被EP整除 | MoE, MoE-MLA |
+| Attention Heads | `num_attention_heads % (tp_size / dp_size) == 0` | Attention heads必须能被TP/DP整除 | 所有模型 |
+| KV Heads | `num_key_value_heads % (tp_size / dp_size) == 0` | KV heads必须能被TP/DP整除 | GQA |
+
+### 8.3 配置推导算法
+
+1. **确定最小TP**：`min_tp = max(1, hidden_size // 2048)`
+2. **确定EP（MoE模型）**：选择满足`n_routed_experts % ep_size == 0`和`min_tp % ep_size == 0 OR ep_size % min_tp == 0`的最大EP值
+3. **确定最终TP**：如果`ep_size > min_tp`，则`tp_size = ep_size`；否则调整`tp_size`满足整除条件
+4. **设备数检查**：如果`tp_size > device_count`，降级为`tp_size = device_count, ep_size = 1`
+
+### 8.4 常见配置参考
+
+| 模型类型 | TP | EP | 设备数 |
+|----------|----|----|--------|
+| dense_7b | 1 | 1 | 1 |
+| dense_70b | 8 | 1 | 8 |
+| moe_64experts | 4 | 4 | 4 |
+| moe_128experts | 8 | 8 | 8 |
+| moe_mla | 4 | 4 | 4 |
+
+## 9. 参考代码
 
 - `python/sglang/srt/models/qwen2.py` - GQA + Gated MLP + RMSNorm
 - `python/sglang/srt/models/llama.py` - Llama架构参考

@@ -1,145 +1,297 @@
 ---
 name: sglang-npu-adapter
-description: 适配新模型到SGLang框架以支持NPU设备。当用户需要在NPU(GPU)上运行SGLang尚未支持的模型时使用此技能。自动分析模型架构、生成适配代码、调试问题并验证正确性。
+description: Adapt new models to the SGLang framework to support NPU devices. Use this skill when users need to run models not yet supported by SGLang on NPU(GPU) devices. Automatically analyzes model architecture, generates adaptation code, debugs issues, and verifies correctness.
 user-invocable: true
 ---
 
-# SGLang NPU模型适配技能
+# SGLang NPU Model Adaptation Skill
 
-帮助用户将新模型适配到SGLang框架，支持在NPU/GPU设备上运行。
+Help users adapt new models to the SGLang framework to support running on NPU/GPU devices.
 
-## 硬性约束
+## Task Tracking and Memory Mechanism
 
-- **永不升级transformers**
-- **主实现根目录为当前项目仓库**
-- 启动命令：`export PYTHONPATH=${PWD}/python:$PYTHONPATH`
-- 默认API端口：`8000`
-- 功能优先默认：验证ACLGraph/DeepEP/DP-Attention/MTP/多模态
-- MoE参数（`--ep-size`等）仅适用于MoE模型
-- **代码修改最小化，仅针对目标模型**
-- **最终交付：单次签名提交**（`git commit -sm ...`）
-- **最终文档使用中文**
-- **Dummy-first加速，但真实权重验证强制**
+To ensure the effective execution of complex tasks, this skill integrates the planning-with-files pattern, using three core memory files to track task progress and important information:
+
+1. **task_plan.md** - Records task phases, progress, and key decisions (based on `templates/task_plan.md` template)
+2. **findings.md** - Records research findings, model analysis results, and technical insights (based on `templates/findings.md` template)
+3. **progress.md** - Records session logs, execution steps, and test results (based on `templates/progress.md` template)
+
+### Template Management
+
+Planning file templates are uniformly stored in the `templates/` directory for easy maintenance and updates. 
+
+### Relationship Between Task Flow and Planning Files
+
+- **Initialization Phase**: Create planning files based on templates
+- **Before each step**: Read planning files to restore context
+- **After each step**: Update planning files to record progress and findings
+- **When task is completed**: Finally update planning files to summarize the entire task execution process
+
+This mechanism ensures that information during task execution is not lost and supports task interruption and recovery.
+
+## Hard Constraints
+
+- For each task, create or read an independent folder in .trae/workspace/ to store input and output during the process
+- **Never upgrade transformers**
+- **Main implementation root directory is the current project repository**
+- Startup command: `export PYTHONPATH=${PWD}/python:$PYTHONPATH`
+- Default API port: `8000`
+- Function priority default: Verify ACLGraph/DeepEP/DP-Attention/MTP/multimodal
+- **Minimize code modifications, only for target models**
+- **Final delivery: Single signed commit** (`git commit -sm ...`)
+- **Final documentation in Chinese**
+- **Dummy-first acceleration, but real weight verification is mandatory**
+- **Task tracking: Must use planning-with-files mode**
 
 ---
 
-## 工作流程
+## Architecture Design
 
+### Agent Roles
+
+| Agent | Role | Core Capabilities | Trigger Timing |
+|-------|------|-------------------|----------------|
+| Agent 1 | Architecture Analyst | Model identification, resource evaluation, configuration derivation, risk identification | Step 2 |
+| Agent 2 | Debug Engineer | Error diagnosis, context correlation, fix generation | Automatically triggered when any step fails |
+| Agent 3 | Verification Engineer | Test generation, execution verification, result analysis | Step 6 |
+
+### Agent Calling Specifications
+
+#### Call Type Constraints
+
+**All Agent calls must use `general_purpose_task` type, forbidden to use other types (such as `search`).**
+**For each Agent, the calling prompt must follow the template in references/shared/agent_call_templates.md**
+
+-------
+
+## Execution Flow
+
+### Step 0: Initialize State Files and Planning Files
+
+**【Mandatory】Execute before any operation:**
+
+1. Create working directory: `mkdir -p {WORKSPACE_DIR}/{input,output,logs}`
+
+2. **【Mandatory】Initialize planning files (planning-with-files mode):**
+   - Create `task_plan.md`: Contains task phases, progress, and key decisions
+   - Create `findings.md`: For recording research findings and technical insights
+   - Create `progress.md`: For recording session logs and execution results
+
+**Usage**: Directly read the corresponding template file and fill in variables (such as <ModelName>, <ModelPath>, {WORKSPACE_DIR})
+
+### Step 1: Collect Context
+
+**Responsibility: Collect information, do not make technical decisions**
+
+1. Use AskUserQuestion to collect:
+   - Model path
+   - Target device (npu/gpu)
+   - Special requirements
+
+2. **【Mandatory】Device detection:**
+```bash
+# NPU device detection
+npu-smi info 2>/dev/null | grep "Ascend" | wc -l
 ```
-步骤1:收集上下文 → 步骤2:Agent1分析 → 步骤3:选择策略 → 步骤4:代码修改 
-→ 步骤5:两阶段验证(失败→Agent2修复) → 步骤6:Agent3测试(失败→Agent2修复) 
-→ 步骤7:生成产物 → 步骤8:交接
-```
+
+3. Write to `input/device_info.json`
+
+4. **【Mandatory】Update planning files:**
+   
+### Step 2: Call Agent 1
+
+1. **【Mandatory】Read planning files to confirm current step**
+2. Create `input/input_params.json` (contains device_info)
+3. Read `prompts/model_analyzer.md` and fill in `{{WORKSPACE_DIR}}`
+4. **Call Task to start Agent 1**:
+   - **subagent_type must be `general_purpose_task`**
+   - query is the filled prompt content
+   - description is "Model architecture analysis"
+5. Parse `output/output_summary.json`
+6. **【Mandatory】Update planning files:**
+   - Update `task_plan.md`: Mark model architecture analysis completion status
+   - Update `findings.md`: Record Agent 1's analysis results and parallel configuration derivation
+   - Update `progress.md`: Record Agent 1 call process and output results
+
+### Step 3: Select Adaptation Strategy
+
+**Based on Agent 1's similarity output:**
+- `high` → Directly reuse reference model
+- `medium` → Reuse and add conditional branches
+- `low` → Create new model file
+
+**【Mandatory】Update planning files:**
+   - Update `task_plan.md`: Mark adaptation strategy selection completion
+   - Update `findings.md`: Record the selected adaptation strategy and reasons
+   - Update `progress.md`: Record adaptation strategy selection process
+
+### Step 4: Implement Code Modifications
+
+**Principles:**
+1. Prioritize reusing existing architecture
+2. Modification isolation: Use conditional branches
+3. NPU compatibility: Prioritize torch native implementation
+4. Minimize modification scope
+
+**【Mandatory】Update planning files:**
+   - Update `task_plan.md`: Mark code modification completion status
+   - Update `findings.md`: Record modified files, key code changes, and technical decisions
+   - Update `progress.md`: Record code implementation process and results
+
+### Step 5: Two-Phase Verification
+
+**Responsibility: Execute verification, automatically trigger Agent 2 on failure**
+
+**【Mandatory】Read planning files to confirm iteration count before execution**
+
+**Stage A: Dummy verification**
+- Success → Enter Stage B, **update planning files**
+- Failure → **【Mandatory】Update planning files and call Agent 2**:
+   - Update `task_plan.md`: Mark verification failure
+   - Update `findings.md`: Record error information and possible causes
+   - Update `progress.md`: Record verification process and failure results
+
+**Stage B: Real weight verification**
+- Success → Enter Step 6, **update planning files**
+- Failure → **【Mandatory】Update planning files and call Agent 2**:
+   - Update `task_plan.md`: Mark verification failure
+   - Update `findings.md`: Record error information and possible causes
+   - Update `progress.md`: Record verification process and failure results
+
+**Update after verification success:**
+   - Update `task_plan.md`: Mark verification phase completion status
+   - Update `findings.md`: Record verification results and performance indicators
+   - Update `progress.md`: Record verification process and success results
+
+### Step 6: Call Agent 3
+
+**Responsibility: Orchestrate calls, do not make test decisions**
+
+1. **【Mandatory】Read planning files to confirm current step**
+2. Create `input/test_config.json` (based on Agent 1 output)
+3. Read `prompts/test_validator.md` and fill in `{{WORKSPACE_DIR}}`
+4. **Call Task to start Agent 3**:
+   - **subagent_type must be `general_purpose_task`**
+   - query is the filled prompt content
+   - description is "Test verification"
+5. Parse `output/test_result.json`
+6. **【Mandatory】Update planning files:**
+   - Update `task_plan.md`: Mark test verification completion status
+   - Update `findings.md`: Record Agent 3's test results and issues
+   - Update `progress.md`: Record Agent 3 call process and output results
+
+### Step 7: Generate Artifacts and Submit
+
+1. Generate tutorial: `./<ModelName>.md`
+2. Signed commit: `git commit -sm "feat: adapt <ModelName> for NPU support"`
+
+**【Mandatory】Update planning files:**
+   - Update `task_plan.md`: Mark task completion, update all phase statuses
+   - Update `findings.md`: Record final artifact information and commit hash
+   - Update `progress.md`: Record completion process and final results
+
+### Step 8: Prepare Handover Artifacts
+
+Chinese analysis report, operation manual, feature status matrix, modified file list, commit hash
 
 ---
 
-## Agent角色
-
-| Agent | 角色 | 调用时机 | 输出文件 |
-|-------|------|----------|----------|
-| Agent 1 | 模型架构分析师 | 步骤2 | output_summary.json |
-| Agent 2 | Debug工程师 | 步骤5/6失败时 | fix_instructions.json |
-| Agent 3 | 测试验证工程师 | 步骤6 | test_result.json |
-
----
-
-## 执行流程
-
-### 步骤1: 收集上下文
-
-使用AskUserQuestion收集：模型路径、目标设备（npu/gpu）、特殊需求
-
-### 步骤2: 调用Agent 1
-
-创建`input/input_params.json`，调用Task，解析`output/output_summary.json`
-
-**关键输出：** architecture_name, architecture_type, recommended_tp, recommended_ep, npu_compatible, reference_model
-
-### 步骤3: 选择适配策略
-
-- **similarity="high"** → 直接复用参考模型
-- **similarity="medium"** → 复用并添加条件分支
-- **similarity="low"** → 新建模型文件
-
-### 步骤4: 实现代码修改
-
-**原则：**
-1. 优先复用现有架构
-2. 修改隔离：使用条件分支，避免影响其他模型
-3. NPU兼容：优先torch native实现跑通功能
-4. 最小化修改范围
-
-### 步骤5: 两阶段验证
-
-**启动命令构建：**
-- 基础参数：`--model-path --port --tp --context-length --device --attention-backend`
-- MoE额外：`--ep-size --moe-a2a-backend --deepep-mode`
-- VLM额外：`--chat-template`
-
-**服务就绪判断：** 参考`references/shared/service_utils.md`
-
-**Stage A: Dummy验证** → 失败调用Agent 2
-**Stage B: 真实权重验证** → 失败调用Agent 2（最多10次迭代）
-
-### 步骤6: 调用Agent 3
-
-创建`input/test_config.json`（基于Agent 1输出），调用Task，解析`output/test_result.json`
-
-**失败处理：**
-- `status=failed/error` → 调用Agent 2
-- `status=config_issue` → 主Skill调整配置
-
-### 步骤7: 生成产物并提交
-
-1. 生成教程：`./<ModelName>.md`
-2. 签名提交：`git commit -sm "feat: adapt <ModelName> for NPU support"`
-
-### 步骤8: 准备交接产物
-
-中文分析报告、运行手册、功能状态矩阵、修改文件列表、提交哈希
-
----
-
-## 文件结构
+## File Structure
 
 ```
 {WORKSPACE_DIR}/
-├── input/           # Agent输入文件
-├── output/          # Agent输出文件
-├── logs/            # 日志
-└── adapter_state.json
+├── adapter_state.json        # ⚠️ Core status file (must be read/written before/after each operation)
+├── task_plan.md              # ⚠️ Task plan file (planning-with-files mode)
+├── findings.md               # ⚠️ Findings record file (planning-with-files mode)
+├── progress.md               # ⚠️ Progress record file (planning-with-files mode)
+├── input/
+│   ├── input_params.json      # Agent 1 input
+│   ├── device_info.json       # Device information
+│   ├── error_context.json     # Agent 2 input
+│   └── test_config.json       # Agent 3 input
+├── output/
+│   ├── output_summary.json    # Agent 1 output
+│   ├── fix_instructions.json  # Agent 2 output
+│   └── test_result.json       # Agent 3 output
+├── logs/
+│   ├── dummy_run.log          # Dummy verification log
+│   └── real_run.log           # Real verification log
 ```
 
 ---
 
-## 错误处理
+## Anti-forgetting Checklist
 
-| 场景 | 处理 |
-|------|------|
-| Agent 1失败 | 询问用户重试或手动提供信息 |
-| 验证失败 | 调用Agent 2，最多10次迭代 |
-| Agent 3失败(代码) | 调用Agent 2 |
-| Agent 3失败(配置) | 主Skill调整配置 |
-| 超过迭代次数 | 询问用户处理方式 |
+### Before Each Operation
+
+- [ ] Read `adapter_state.json` (machine-readable status)
+- [ ] Read `task_plan.md` (task phases and progress)
+- [ ] Read `findings.md` (research findings and technical insights)
+- [ ] Read `progress.md` (session logs and execution results)
+- [ ] Confirm current step
+- [ ] Check if `next_action` is `call_agent2`
+- [ ] Check if iteration count exceeds limit
+
+### After Each Operation
+
+- [ ] Update `adapter_state.json` (machine-readable status)
+- [ ] Update `task_plan.md` (task phases and progress)
+- [ ] Update `findings.md` (research findings and technical insights)
+- [ ] Update `progress.md` (session logs and execution results)
+- [ ] Record error information (if any)
+- [ ] Set correct `next_action`
+- [ ] Update timestamp
+
+### When Verification Fails
+
+- [ ] Immediately update all planning files
+- [ ] Record complete error log to adapter_state.json
+- [ ] Analyze error causes in findings.md
+- [ ] Record failure process in progress.md
+- [ ] Increase iteration count
+- [ ] Call Agent 2
 
 ---
 
-## 质量门禁
+## Reference Documents Structure
 
-- [ ] 服务成功启动
-- [ ] 推理请求成功（不仅是启动）
-- [ ] 功能集已报告：ACLGraph/DeepEP/MTP/多模态
-- [ ] 容量基线（128k+bs16）已报告
-- [ ] Dummy+真实权重证据存在
-- [ ] 教程文档存在
-- [ ] 单次签名提交
-- [ ] 最终响应包含提交哈希、文件路径、关键命令
+```
+references/
+├── agent1_analyst/               # Model Architecture Analyst references
+│   ├── llm_architecture.md       # LLM architecture identification
+│   ├── moe_architecture.md       # MoE architecture details
+│   ├── mla_architecture.md       # MLA architecture details
+│   ├── vlm_architecture.md       # VLM architecture details
+│   ├── memory_calculation.md     # Memory calculation models
+│   ├── npu_specifications.md     # NPU specifications
+│   └── sglang_model_registry.md  # SGLang model registry
+├── agent2_debug/                 # Debug Engineer references
+│   ├── common_errors.md          # Common error patterns
+│   ├── npu_specific_issues.md    # NPU specific issues
+│   ├── attention_debug.md        # Attention mechanism debugging
+│   ├── moe_debug.md              # MoE debugging
+│   └── rope_debug.md             # RoPE position encoding debugging
+├── agent3_validator/             # Test Validation Engineer references
+│   ├── basic_inference_test.md   # Basic inference tests
+│   ├── correctness_validation.md # Correctness validation methods
+│   ├── npu_validation.md         # NPU-specific validation
+│   └── performance_benchmark.md  # Performance benchmarking
+└── shared/
+    ├── sglang_basics.md          # SGLang fundamentals
+    ├── npu_basics.md             # NPU basics
+    ├── service_utils.md          # Service utilities
+    └── agent_call_templates.md   # Agent calling templates
+```
 
 ---
 
-## 知识库参考
+## Quality Gate
 
-- `references/shared/sglang_basics.md` - SGLang基础
-- `references/shared/npu_basics.md` - NPU基础
-- `references/shared/agent_call_templates.md` - Agent调用模板
-- `references/shared/service_utils.md` - 服务工具函数
+- [ ] Service started successfully
+- [ ] Inference request succeeded (not just startup)
+- [ ] Feature set reported: ACLGraph/DeepEP/MTP/multimodal
+- [ ] Capacity baseline (128k+bs16) reported
+- [ ] Dummy+real weight evidence exists
+- [ ] Tutorial documentation exists
+- [ ] Single signed commit
+- [ ] Final response contains commit hash, file paths, key commands
