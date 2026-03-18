@@ -140,23 +140,33 @@ npu-smi info 2>/dev/null | grep "Ascend" | wc -l
 
 ### Step 5: Two-Phase Verification
 
-**Responsibility: Execute verification, automatically trigger Agent 2 on failure**
+**【Hard Constraint】Must call Agent 2 when encountering any error, Main Skill is prohibited from debugging itself**
 
 **【Mandatory】Read planning files to confirm iteration count before execution**
 
 **Stage A: Dummy verification**
 - Success → Enter Stage B, **update planning files**
-- Failure → **【Mandatory】Update planning files and call Agent 2**:
+- Failure → **【Mandatory】Update planning files and immediately call Agent 2 to debug**:
    - Update `task_plan.md`: Mark verification failure
    - Update `findings.md`: Record error information and possible causes
    - Update `progress.md`: Record verification process and failure results
+   - Wait for Agent 2 to return fix results
+   - Apply Agent 2's fix
+   - Re-verify
 
 **Stage B: Real weight verification**
 - Success → Enter Step 6, **update planning files**
-- Failure → **【Mandatory】Update planning files and call Agent 2**:
+- Failure → **【Mandatory】Update planning files and immediately call Agent 2 to debug**:
    - Update `task_plan.md`: Mark verification failure
    - Update `findings.md`: Record error information and possible causes
    - Update `progress.md`: Record verification process and failure results
+   - Wait for Agent 2 to return fix results
+   - Apply Agent 2's fix
+   - Re-verify
+
+**Iteration Limit:**
+- Maximum iterations: 5
+- Exceeding limit: Report to user and request help
 
 **Update after verification success:**
    - Update `task_plan.md`: Mark verification phase completion status
