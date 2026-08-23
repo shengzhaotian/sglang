@@ -69,6 +69,7 @@ class QuantizationConfig(ABC):
     quantized_model_path: str | None = None
     checkpoint_uses_native_qkv_layout: bool = False
     supports_srt_linear_layers: bool = False
+    supports_quantized_embeddings: bool = False
 
     def __init__(self):
         super().__init__()
