@@ -85,6 +85,8 @@ from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
+_ONLINE_ENCODER_QUANTIZATIONS = frozenset({"fp8", "kitchen_int8", "mxfp4"})
+
 _TRANSFORMERS_ENCODER_ONLY_CLASSES = {
     "T5EncoderModel": transformers.T5EncoderModel,
     "T5Model": transformers.T5EncoderModel,
@@ -156,8 +158,14 @@ def _configure_encoder_quantization(
     component_model_path: str,
     component_weights_path: str,
     component_name: str,
+    explicit_quantization: str | None = None,
 ) -> None:
     if getattr(model_cls, "manages_checkpoint_quantization", False):
+        if explicit_quantization is not None:
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} manages its own checkpoint quantization and "
+                "does not support an online quantization override"
+            )
         # Preserve model-owned formats such as Ideogram's bitsandbytes state.
         # Those models parse metadata, construct layers, and attach quant states
         # themselves; running the generic lifecycle as well would process twice.
@@ -179,6 +187,24 @@ def _configure_encoder_quantization(
             f"Cannot configure checkpoint quantization for {component_name!r}: {error}"
         ) from error
     model_config.quant_config = quant_config
+    if explicit_quantization is not None:
+        if quant_config is not None:
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} already declares checkpoint quantization; "
+                "drop the explicit online quantization override"
+            )
+        if explicit_quantization not in _ONLINE_ENCODER_QUANTIZATIONS:
+            raise ComponentCheckpointUnsupportedError(
+                f"Online quantization {explicit_quantization!r} is not supported "
+                f"for native encoders; choose one of "
+                f"{sorted(_ONLINE_ENCODER_QUANTIZATIONS)}"
+            )
+        from sglang.multimodal_gen.runtime.layers.quantization import (
+            get_quantization_config,
+        )
+
+        model_config.quant_config = get_quantization_config(explicit_quantization)()
+        quant_config = model_config.quant_config
     if quant_config is None:
         return
     if not issubclass(model_cls, EncoderTensorParallelMixin):
@@ -195,6 +221,7 @@ def _resolve_and_configure_encoder_quantization(
     component_model_path: str,
     component_weights_path: str,
     component_name: str,
+    explicit_quantization: str | None = None,
 ) -> type[nn.Module]:
     architectures = getattr(model_config, "architectures", [])
     try:
@@ -215,6 +242,11 @@ def _resolve_and_configure_encoder_quantization(
                 f"Cannot parse checkpoint quantization for {component_name!r}: "
                 f"{quantization_error}"
             ) from quantization_error
+        if explicit_quantization is not None and quant_config is None:
+            raise ComponentCheckpointUnsupportedError(
+                f"Online quantization for {component_name!r} requires an in-tree "
+                f"native encoder; unsupported architectures: {architectures}"
+            ) from resolution_error
         if quant_config is None:
             raise
         raise ComponentCheckpointUnsupportedError(
@@ -229,6 +261,7 @@ def _resolve_and_configure_encoder_quantization(
         component_model_path,
         component_weights_path,
         component_name,
+        explicit_quantization,
     )
     return model_cls
 
@@ -353,6 +386,14 @@ class TextEncoderLoader(ComponentLoader):
 
     component_names = ["text_encoder"]
     expected_library = "transformers"
+    supports_component_quantization = True
+
+    def should_raise_customized_load_error(
+        self, server_args: ServerArgs, component_name: str
+    ) -> bool:
+        return super().should_raise_customized_load_error(
+            server_args, component_name
+        ) or component_name in getattr(server_args, "component_quantizations", {})
 
     @staticmethod
     def resolve_model_weights_path(
@@ -599,6 +640,7 @@ class TextEncoderLoader(ComponentLoader):
             component_model_path,
             component_weights_path,
             component_name,
+            getattr(server_args, "component_quantizations", {}).get(component_name),
         )
         encoder_dp_group = get_encoder_data_parallel_group()
         prefer_dp = (
