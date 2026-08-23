@@ -233,6 +233,41 @@ class TestVendoredRuntimeDetection(CustomTestCase):
             )
 
 
+class TestChildCommand(CustomTestCase):
+    def test_workload_options_reach_the_phase_children(self):
+        # --graph-nodes was accepted by the parent and dropped here, so a
+        # calibration run at 4 nodes silently measured the default 64.
+        probe = _load_probe()
+        args = probe.build_parser().parse_args(
+            ["--graph-nodes", "4", "--replays", "2", "--matmul-size", "256"]
+        )
+        cmd = probe.child_command("graph", args)
+        self.assertEqual(
+            cmd[-8:],
+            [
+                "--phase",
+                "graph",
+                "--replays",
+                "2",
+                "--matmul-size",
+                "256",
+                "--graph-nodes",
+                "4",
+            ],
+        )
+
+    def test_every_option_is_either_forwarded_or_parent_only(self):
+        # The guard that keeps the bug above from coming back with the next knob.
+        probe = _load_probe()
+        options = {
+            action.dest
+            for action in probe.build_parser()._actions
+            if action.dest != "help"
+        }
+        accounted = set(probe.PHASE_OPTIONS) | set(probe.PARENT_ONLY_OPTIONS)
+        self.assertEqual(options - accounted, set())
+
+
 class TestPreloadValue(CustomTestCase):
     def test_names_the_real_files_and_skips_the_symlinks(self):
         # Preloading the unversioned symlink is not what was measured, and the

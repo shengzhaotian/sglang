@@ -45,6 +45,8 @@ TRACING_LIB_PATTERN = re.compile(
 )
 # The libraries whose version decides whether graph replay is traced.
 RUNTIME_LIBS = ("libamdhip64", "libroctracer64")
+# Options that shape the workload, so the phase children need all of them.
+PHASE_OPTIONS = ("replays", "matmul_size", "graph_nodes")
 
 
 def loaded_tracing_libs() -> list[str]:
@@ -233,17 +235,21 @@ def phase_profile(use_graph: bool, replays: int, size: int, nodes: int) -> dict:
     }
 
 
+def child_command(phase: str, args: argparse.Namespace) -> list[str]:
+    """The child invocation for one phase, carrying every workload option.
+
+    Built from PHASE_OPTIONS rather than by hand: a knob that the parent accepts
+    and forgets to forward is silently ignored, and the child's own default then
+    stands in for it.
+    """
+    cmd = [sys.executable, os.path.abspath(__file__), "--phase", phase]
+    for name in PHASE_OPTIONS:
+        cmd += [f"--{name.replace('_', '-')}", str(getattr(args, name))]
+    return cmd
+
+
 def run_child(phase: str, args: argparse.Namespace) -> dict:
-    cmd = [
-        sys.executable,
-        os.path.abspath(__file__),
-        "--phase",
-        phase,
-        "--replays",
-        str(args.replays),
-        "--matmul-size",
-        str(args.matmul_size),
-    ]
+    cmd = child_command(phase, args)
     # New session so a HIP runtime wedged past SIGTERM can still be killed as a group.
     proc = subprocess.Popen(
         cmd,
@@ -293,7 +299,10 @@ def traced_everything(result: dict) -> bool:
     return kernels is not None and expected is not None and kernels >= expected
 
 
-def main() -> int:
+PARENT_ONLY_OPTIONS = ("phase", "timeout", "print_ld_preload")
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--phase",
@@ -325,6 +334,11 @@ def main() -> int:
         help="print the LD_PRELOAD that forces the ROCm install's HIP and roctracer, "
         "for callers that have to set it before starting the process, and exit",
     )
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.print_ld_preload:
