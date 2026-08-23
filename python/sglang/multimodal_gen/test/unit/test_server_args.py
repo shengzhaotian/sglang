@@ -169,6 +169,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 "model_path": "/data/my-model",
                 "component_paths": {
                     "text_encoder": "owner/repo/text_encoder/model.safetensors",
+                    "audio_vae": "owner/repo/vae/audio.safetensors",
                     "vae": "owner/repo/vae",
                 },
             }
@@ -177,7 +178,10 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(args.component_paths, {"vae": "owner/repo/vae"})
         self.assertEqual(
             args.component_weights_paths,
-            {"text_encoder": "owner/repo/text_encoder/model.safetensors"},
+            {
+                "text_encoder": "owner/repo/text_encoder/model.safetensors",
+                "audio_vae": "owner/repo/vae/audio.safetensors",
+            },
         )
 
     def test_component_attention_backends_are_normalized(self):
