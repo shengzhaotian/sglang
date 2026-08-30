@@ -2756,13 +2756,44 @@ def set_gpu_proc_affinity(
 
     # set cpu_affinity to current process
     # p.cpu_affinity(bind_cpu_ids)
-    cpu_ids_group0 = [id for id in range(288, 283)]
-    cpu_ids_group1 = [id for id in range(96, 191)]
-    if gpu_id in [0, 1, 6, 7]:
-        p.cpu_affinity(cpu_ids_group0)
-    else:
-        p.cpu_affinity(cpu_ids_group1)
-    logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
+    #
+    # Bind each GPU worker process to a fixed, non-overlapping slice of CPU cores.
+    # GPUs are partitioned into groups; every group owns a disjoint core range,
+    # and that range is split into one contiguous slice per GPU in the group, so
+    # processes in the same group never share cores.
+    #
+    #   group0: gpu_id in {0, 1, 6, 7} -> cores 288..382
+    #   group1: gpu_id in {2, 3, 4, 5} -> cores  96..190
+    core_groups = (
+        {"gpu_ids": [0, 1, 6, 7], "core_range": range(288, 383)},
+        {"gpu_ids": [2, 3, 4, 5], "core_range": range(96, 191)},
+    )
+
+    for group in core_groups:
+        if gpu_id not in group["gpu_ids"]:
+            continue
+
+        cores = list(group["core_range"])
+        rank = group["gpu_ids"].index(gpu_id)
+        n_procs = len(group["gpu_ids"])
+
+        # Partition `cores` into `n_procs` contiguous slices; spread the remainder
+        # so the earliest ranks get at most one extra core. The resulting slices
+        # are pairwise disjoint, so no two processes in the group share a core.
+        chunk_size, remainder = divmod(len(cores), n_procs)
+        start = rank * chunk_size + min(rank, remainder)
+        end = start + chunk_size + (1 if rank < remainder else 0)
+
+        p.cpu_affinity(cores[start:end])
+        logger.info(
+            f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}"
+        )
+        return
+
+    logger.warning(
+        f"Process {pid} gpu_id {gpu_id} is not in any CPU affinity group; "
+        f"leaving CPU affinity unset."
+    )
 
 
 def permute_weight(x: torch.Tensor) -> torch.Tensor:
