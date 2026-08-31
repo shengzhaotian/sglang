@@ -1212,11 +1212,16 @@ class HiRadixCache(RadixCache):
         # torch.cat) instead of one free per leaf, cutting NPU op count and
         # dispatch overhead.
         pending_free: List[torch.Tensor] = []
-        if self.cache_controller.write_policy == "write_back":
-            num_evicted = self._evict_write_back(num_tokens, pending_free)
-        else:
-            num_evicted = self._evict_write_through(num_tokens, pending_free)
-        self._flush_device_frees(pending_free)
+        try:
+            if self.cache_controller.write_policy == "write_back":
+                num_evicted = self._evict_write_back(num_tokens, pending_free)
+            else:
+                num_evicted = self._evict_write_through(num_tokens, pending_free)
+        finally:
+            # Flush even on exception: pages already detached from the tree must
+            # return to the allocator or they leak (the pre-batch code freed
+            # each leaf immediately, so it had no such failure mode).
+            self._flush_device_frees(pending_free)
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
