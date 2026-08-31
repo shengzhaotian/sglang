@@ -12,10 +12,26 @@ _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBU
 _PREFILL_ADMISSION_DEBUG = get_bool_env_var("SGLANG_DEBUG_PREFILL_ADMISSION")
 logger = logging.getLogger(__name__)
 
+# Debug admission logging bypasses the logging module and stderr entirely:
+# it appends to a plain file with os.write (O_APPEND), so a stalled PTY/pipe
+# consumer can never block the scheduler thread (the earlier stderr-based
+# version froze the whole server under output backpressure).
+_ADMISSION_LOG_PATH = "/tmp/new-req.log"
+_admission_log_fd = None
+
 
 def _prefill_admission_log(msg: str) -> None:
-    if _PREFILL_ADMISSION_DEBUG:
-        logger.info(f"[prefill-admission] {msg}")
+    if not _PREFILL_ADMISSION_DEBUG:
+        return
+    global _admission_log_fd
+    import time
+
+    if _admission_log_fd is None:
+        _admission_log_fd = os.open(
+            _ADMISSION_LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644
+        )
+    line = f"{time.time():.3f} [prefill-admission] {msg}\n".encode("utf-8")
+    os.write(_admission_log_fd, line)
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
