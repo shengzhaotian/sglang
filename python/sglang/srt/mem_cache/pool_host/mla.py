@@ -620,6 +620,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         meta = torch.empty(pinned_meta.shape, dtype=torch.int64, device=device)
         meta.copy_(pinned_meta, non_blocking=True)
         track_pinned_staging(pinned_meta)
+        from sglang.srt.mem_cache.layer_first_debug import log_transfer_launch
+
+        log_transfer_launch(
+            "sparse_copy", direction, layer_start, layer_num, num_pages
+        )
         ret = offload.kv_exchange_copy(meta, device)
         if ret != 0:
             raise RuntimeError(f"offload.kv_exchange_copy failed with code {ret}")
