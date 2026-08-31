@@ -336,6 +336,13 @@ else:
 
 logger = logging.getLogger(__name__)
 
+_PREFILL_ADMISSION_DEBUG = get_bool_env_var("SGLANG_DEBUG_PREFILL_ADMISSION")
+
+
+def _prefill_admission_log(msg: str) -> None:
+    if _PREFILL_ADMISSION_DEBUG:
+        logger.info(f"[prefill-admission] {msg}")
+
 
 def _prewarm_hccl_group(device, group, device_module):
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
@@ -3324,6 +3331,12 @@ class Scheduler(
 
             running_bs = len(running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+                _prefill_admission_log(
+                    f"stop reason=allocatable_reqs_limit "
+                    f"can_run={len(adder.can_run_list)} "
+                    f"allocatable={self.get_num_allocatable_reqs(running_bs)} "
+                    f"running_bs={running_bs}"
+                )
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
@@ -3336,6 +3349,10 @@ class Scheduler(
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
+                    _prefill_admission_log(
+                        f"stop reason=batch_is_full rid={req.rid} "
+                        f"can_run={len(adder.can_run_list)}"
+                    )
                     break
 
             if self.enable_hicache_storage:
@@ -3359,6 +3376,10 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
+                _prefill_admission_log(
+                    f"stop reason=add_one_req_{res.name} rid={req.rid} "
+                    f"can_run={len(adder.can_run_list)}"
+                )
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
