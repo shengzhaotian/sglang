@@ -3037,8 +3037,20 @@ class Scheduler(
             ret = None
             # Preserve DP-attention MLP sync even when idle.
             if self.require_mlp_sync:
+                need_mlp_sync = True
+                if (
+                    not self.spec_algorithm.is_none()
+                    and not get_spec().speculative_skip_dp_mlp_sync
+                ):
+                    # Match the slow path's prefill/spec-check collective. Its
+                    # return value is globally consistent: if any DP rank has
+                    # a prefill batch, idle ranks receive an IDLE batch;
+                    # otherwise every rank receives None and must participate
+                    # in the final decode/idle sync below.
+                    ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
+                    need_mlp_sync = ret is None
                 ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
-                    ret, need_sync=True
+                    ret, need_sync=need_mlp_sync
                 )
             ret = self.ngram_embedding_manager.prepare_for_forward(
                 ret, chunked_req=self.chunked_req
