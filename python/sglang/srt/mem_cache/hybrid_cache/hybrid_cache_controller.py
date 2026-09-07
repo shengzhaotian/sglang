@@ -26,6 +26,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     make_timing_event_pair,
 )
+from sglang.srt.mem_cache import layer_first_debug as _layer_first_debug
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
@@ -439,9 +440,22 @@ class HybridCacheController(BaseHiCacheController):
             and os.environ.get("ENABLE_LAYER_FIRST", "0") == "1"
             and host_indices.numel() > 0
         ):
+            sort_ev0 = sort_ev1 = None
+            if _layer_first_debug.enabled():
+                sort_ev0 = device_module.Event(enable_timing=True)
+                sort_ev1 = device_module.Event(enable_timing=True)
+                sort_ev0.record()
             sort_idx = torch.argsort(host_indices)
             host_indices = host_indices[sort_idx]
             device_indices = device_indices[sort_idx]
+            sort_ms = None
+            if _layer_first_debug.enabled():
+                sort_ev1.record()
+                sort_ev1.synchronize()
+                sort_ms = sort_ev0.elapsed_time(sort_ev1)
+            _layer_first_debug.log_merge_stats(
+                "write", host_indices, device_indices, self.page_size, sort_ms
+            )
         self.write_queue.clear()
         start_event = device_module.Event()
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
@@ -581,9 +595,22 @@ class HybridCacheController(BaseHiCacheController):
             and os.environ.get("ENABLE_LAYER_FIRST", "0") == "1"
             and host_indices.numel() > 0
         ):
+            sort_ev0 = sort_ev1 = None
+            if _layer_first_debug.enabled():
+                sort_ev0 = device_module.Event(enable_timing=True)
+                sort_ev1 = device_module.Event(enable_timing=True)
+                sort_ev0.record()
             sort_idx = torch.argsort(host_indices)
             host_indices = host_indices[sort_idx]
             device_indices = device_indices[sort_idx]
+            sort_ms = None
+            if _layer_first_debug.enabled():
+                sort_ev1.record()
+                sort_ev1.synchronize()
+                sort_ms = sort_ev0.elapsed_time(sort_ev1)
+            _layer_first_debug.log_merge_stats(
+                "load", host_indices, device_indices, self.page_size, sort_ms
+            )
             # Record on the current (default) stream so load_stream can wait.
             sort_event = device_module.Event()
             sort_event.record()

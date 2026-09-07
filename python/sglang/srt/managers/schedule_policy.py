@@ -9,7 +9,29 @@ from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
+_PREFILL_ADMISSION_DEBUG = get_bool_env_var("SGLANG_DEBUG_PREFILL_ADMISSION")
 logger = logging.getLogger(__name__)
+
+# Debug admission logging bypasses the logging module and stderr entirely:
+# it appends to a plain file with os.write (O_APPEND), so a stalled PTY/pipe
+# consumer can never block the scheduler thread (the earlier stderr-based
+# version froze the whole server under output backpressure).
+_ADMISSION_LOG_PATH = "/tmp/new-req.log"
+_admission_log_fd = None
+
+
+def _prefill_admission_log(msg: str) -> None:
+    if not _PREFILL_ADMISSION_DEBUG:
+        return
+    global _admission_log_fd
+    import time
+
+    if _admission_log_fd is None:
+        _admission_log_fd = os.open(
+            _ADMISSION_LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644
+        )
+    line = f"{time.time():.3f} [prefill-admission] {msg}\n".encode("utf-8")
+    os.write(_admission_log_fd, line)
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -840,16 +862,32 @@ class PrefillAdder:
         if not no_token and self.rem_mamba_slots is not None:
             no_token = self.rem_mamba_slots <= 0
         if no_token:
+            _prefill_admission_log(
+                f"reject reason=budget_no_token "
+                f"rem_total_tokens={self.rem_total_tokens}"
+            )
             return AddReqResult.NO_TOKEN
 
         if self.rem_input_tokens <= 0:
+            _prefill_admission_log(
+                f"reject reason=max_prefill_tokens_exhausted "
+                f"rem_input_tokens={self.rem_input_tokens}"
+            )
             return AddReqResult.OTHER
 
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
+                _prefill_admission_log(
+                    f"reject reason=dllm_tokens_exhausted "
+                    f"rem_dllm_tokens={self.rem_dllm_tokens}"
+                )
                 return AddReqResult.OTHER
         else:
             if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:
+                _prefill_admission_log(
+                    f"reject reason=chunk_budget_exhausted "
+                    f"rem_chunk_tokens={self.rem_chunk_tokens}"
+                )
                 return AddReqResult.OTHER
 
         return AddReqResult.CONTINUE
@@ -1202,6 +1240,10 @@ class PrefillAdder:
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
+            _prefill_admission_log(
+                f"reject rid={req.rid} reason=prefill_max_requests "
+                f"can_run={len(self.can_run_list)} limit={x}"
+            )
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
@@ -1228,6 +1270,10 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
+            _prefill_admission_log(
+                f"reject rid={req.rid} reason=kv_pool_budget "
+                f"total_tokens={total_tokens} rem_total_tokens={self.rem_total_tokens}"
+            )
             return AddReqResult.NO_TOKEN
 
         chunk_tokens_limit = self.rem_chunk_tokens
@@ -1262,11 +1308,21 @@ class PrefillAdder:
             # If without chunked prefill:
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
             # - if the can_run_list is empty, always accept the first prefill request
+            _prefill_admission_log(
+                f"reject rid={req.rid} reason=max_prefill_tokens "
+                f"real_input_tokens={real_input_tokens} "
+                f"rem_input_tokens={self.rem_input_tokens}"
+            )
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
+                _prefill_admission_log(
+                    f"reject rid={req.rid} reason=kv_pool_budget_after_lock "
+                    f"total_tokens={total_tokens} "
+                    f"rem_total_tokens={self.rem_total_tokens}"
+                )
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:
@@ -1328,6 +1384,11 @@ class PrefillAdder:
                 # If without chunked prefill:
                 # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
                 # - if the can_run_list is empty, always accept the first prefill request
+                _prefill_admission_log(
+                    f"reject rid={req.rid} reason=max_prefill_tokens_after_lock "
+                    f"input_tokens={input_tokens} "
+                    f"rem_input_tokens={self.rem_input_tokens}"
+                )
                 return AddReqResult.OTHER
 
             if self.dllm_config is not None:
@@ -1356,6 +1417,10 @@ class PrefillAdder:
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                 )
                 self.can_run_list.append(req)
+                _prefill_admission_log(
+                    f"admit rid={req.rid} mode=full input_tokens={input_tokens} "
+                    f"can_run={len(self.can_run_list)}"
+                )
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
@@ -1375,6 +1440,11 @@ class PrefillAdder:
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 
                 if trunc_len <= 0:
+                    _prefill_admission_log(
+                        f"reject rid={req.rid} reason=chunk_budget_no_page "
+                        f"rem_chunk_tokens={self.rem_chunk_tokens} "
+                        f"page_size={self.page_size}"
+                    )
                     return AddReqResult.OTHER
 
                 # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
@@ -1382,6 +1452,11 @@ class PrefillAdder:
                 # we need the prefill prefix length to be multiple of attention split size
                 if truncation_align_size is not None:
                     if trunc_len < truncation_align_size:
+                        _prefill_admission_log(
+                            f"reject rid={req.rid} reason=truncation_align_size "
+                            f"trunc_len={trunc_len} "
+                            f"align={truncation_align_size}"
+                        )
                         return AddReqResult.OTHER
                     else:
                         trunc_len = truncation_align_size * (
@@ -1393,6 +1468,11 @@ class PrefillAdder:
                 trunc_len = now_input_len - len(req.prefix_indices)
 
                 if trunc_len <= 0:
+                    _prefill_admission_log(
+                        f"reject rid={req.rid} reason=chunk_trunc_len_zero "
+                        f"chunk_tokens_limit={chunk_tokens_limit} "
+                        f"prefix_len={len(req.prefix_indices)}"
+                    )
                     return AddReqResult.OTHER
 
                 if (
@@ -1407,6 +1487,10 @@ class PrefillAdder:
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
+                _prefill_admission_log(
+                    f"admit rid={req.rid} mode=chunk trunc_len={trunc_len} "
+                    f"can_run={len(self.can_run_list)}"
+                )
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import atexit
 import heapq
@@ -1207,12 +1207,32 @@ class HiRadixCache(RadixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
-        if self.cache_controller.write_policy == "write_back":
-            num_evicted = self._evict_write_back(num_tokens)
-        else:
-            num_evicted = self._evict_write_through(num_tokens)
+        # Batch device frees: one evict round evicts many leaves; collect their
+        # KV indices and issue a single allocator.free (one torch.unique + one
+        # torch.cat) instead of one free per leaf, cutting NPU op count and
+        # dispatch overhead.
+        pending_free: List[torch.Tensor] = []
+        try:
+            if self.cache_controller.write_policy == "write_back":
+                num_evicted = self._evict_write_back(num_tokens, pending_free)
+            else:
+                num_evicted = self._evict_write_through(num_tokens, pending_free)
+        finally:
+            # Flush even on exception: pages already detached from the tree must
+            # return to the allocator or they leak (the pre-batch code freed
+            # each leaf immediately, so it had no such failure mode).
+            self._flush_device_frees(pending_free)
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
+
+    def _flush_device_frees(self, pending_free: List[torch.Tensor]) -> None:
+        if not pending_free:
+            return
+        if len(pending_free) == 1:
+            indices = pending_free[0]
+        else:
+            indices = torch.cat(pending_free)
+        self.cache_controller.mem_pool_device_allocator.free(indices)
 
     def _make_eviction_heap(self):
         heap = [
@@ -1228,7 +1248,9 @@ class HiRadixCache(RadixCache):
         if p is not self.root_node and all(c.evicted for c in p.children.values()):
             heapq.heappush(heap, (self.eviction_strategy.get_priority(p), p))
 
-    def _evict_write_through(self, num_tokens: int) -> int:
+    def _evict_write_through(
+        self, num_tokens: int, pending_free: List[torch.Tensor]
+    ) -> int:
         """write_through / write_through_selective: drop non-backuped leaves,
         demote already-backuped ones. Nothing is staged to host during eviction,
         so this is a plain on-the-fly pass.
@@ -1240,13 +1262,15 @@ class HiRadixCache(RadixCache):
             if x.lock_ref > 0:
                 continue
             if x.backuped:
-                num_evicted += self._evict_backuped(x)
+                num_evicted += self._evict_backuped(x, pending_free)
             else:
-                num_evicted += self._evict_regular(x)
+                num_evicted += self._evict_regular(x, pending_free)
             self._promote_parent(x, heap)
         return num_evicted
 
-    def _evict_write_back(self, num_tokens: int) -> int:
+    def _evict_write_back(
+        self, num_tokens: int, pending_free: List[torch.Tensor]
+    ) -> int:
         """eviction for write_back mode: demote already-backuped leaves, stage non-backuped ones to host if possible, otherwise drop them.
         note this path will be deprecated in the future.
         """
@@ -1259,7 +1283,7 @@ class HiRadixCache(RadixCache):
                 return
             self.writing_check(write_back=True)
             for node, device_indices in staged:
-                self.cache_controller.evict_device(device_indices)
+                pending_free.append(device_indices)
                 node.release_host()
             staged.clear()
 
@@ -1268,14 +1292,14 @@ class HiRadixCache(RadixCache):
             if x.lock_ref > 0:
                 continue
             if x.backuped:
-                num_evicted += self._evict_backuped(x)
+                num_evicted += self._evict_backuped(x, pending_free)
             elif self.write_backup(x, write_back=True) > 0:
                 x.protect_host()
                 staged.append((x, x.value))
                 num_evicted += self._detach_backuped(x)
             else:
                 flush_staged()
-                num_evicted += self._drop_subtree_no_host(x)
+                num_evicted += self._drop_subtree_no_host(x, pending_free)
             self._promote_parent(x, heap)
         flush_staged()
         return num_evicted
@@ -1293,23 +1317,35 @@ class HiRadixCache(RadixCache):
         self._update_leaf_status(node.parent)
         return num_evicted
 
-    def _evict_backuped(self, node: TreeNode):
+    def _evict_backuped(
+        self, node: TreeNode, pending_free: Optional[List[torch.Tensor]] = None
+    ):
         device_indices = node.value
         num_evicted = self._detach_backuped(node)
-        self.cache_controller.evict_device(device_indices)
+        if pending_free is None:
+            self.cache_controller.evict_device(device_indices)
+        else:
+            pending_free.append(device_indices)
         return num_evicted
 
-    def _evict_regular(self, node: TreeNode):
+    def _evict_regular(
+        self, node: TreeNode, pending_free: Optional[List[torch.Tensor]] = None
+    ):
         # evict a node not initiated write to host -- emit BlockRemoved
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
 
         self._record_remove_event(node)
-        self.cache_controller.mem_pool_device_allocator.free(node.value)
+        if pending_free is None:
+            self.cache_controller.mem_pool_device_allocator.free(node.value)
+        else:
+            pending_free.append(node.value)
         num_evicted = len(node.value)
         self._delete_leaf(node)
         return num_evicted
 
-    def _drop_subtree_no_host(self, root: TreeNode) -> int:
+    def _drop_subtree_no_host(
+        self, root: TreeNode, pending_free: Optional[List[torch.Tensor]] = None
+    ) -> int:
         nodes = []
         stack = [root]
         while stack:
@@ -1334,7 +1370,10 @@ class HiRadixCache(RadixCache):
                 n.host_value = None
             if n.value is not None:
                 self._record_remove_event(n, medium=StorageMedium.GPU)
-                self.cache_controller.mem_pool_device_allocator.free(n.value)
+                if pending_free is None:
+                    self.cache_controller.mem_pool_device_allocator.free(n.value)
+                else:
+                    pending_free.append(n.value)
                 freed_device += len(n.value)
                 self.evictable_size_ -= len(n.value)
                 n.value = None

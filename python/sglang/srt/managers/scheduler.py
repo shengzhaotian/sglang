@@ -336,6 +336,29 @@ else:
 
 logger = logging.getLogger(__name__)
 
+_PREFILL_ADMISSION_DEBUG = get_bool_env_var("SGLANG_DEBUG_PREFILL_ADMISSION")
+
+# Debug admission logging bypasses the logging module and stderr entirely:
+# it appends to a plain file with os.write (O_APPEND), so a stalled PTY/pipe
+# consumer can never block the scheduler thread (the earlier stderr-based
+# version froze the whole server under output backpressure).
+_ADMISSION_LOG_PATH = "/tmp/new-req.log"
+_admission_log_fd = None
+
+
+def _prefill_admission_log(msg: str) -> None:
+    if not _PREFILL_ADMISSION_DEBUG:
+        return
+    global _admission_log_fd
+    import time
+
+    if _admission_log_fd is None:
+        _admission_log_fd = os.open(
+            _ADMISSION_LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644
+        )
+    line = f"{time.time():.3f} [prefill-admission] {msg}\n".encode("utf-8")
+    os.write(_admission_log_fd, line)
+
 
 def _prewarm_hccl_group(device, group, device_module):
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
@@ -3324,6 +3347,12 @@ class Scheduler(
 
             running_bs = len(running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+                _prefill_admission_log(
+                    f"stop reason=allocatable_reqs_limit "
+                    f"can_run={len(adder.can_run_list)} "
+                    f"allocatable={self.get_num_allocatable_reqs(running_bs)} "
+                    f"running_bs={running_bs}"
+                )
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
@@ -3336,6 +3365,10 @@ class Scheduler(
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
+                    _prefill_admission_log(
+                        f"stop reason=batch_is_full rid={req.rid} "
+                        f"can_run={len(adder.can_run_list)}"
+                    )
                     break
 
             if self.enable_hicache_storage:
@@ -3359,6 +3392,10 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
+                _prefill_admission_log(
+                    f"stop reason=add_one_req_{res.name} rid={req.rid} "
+                    f"can_run={len(adder.can_run_list)}"
+                )
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
