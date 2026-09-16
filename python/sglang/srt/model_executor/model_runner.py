@@ -1026,34 +1026,102 @@ class ModelRunner:
         if dcp_group.world_size <= 1:
             return
         n_prepared = 0
+        n_mla = 0
+        # NPU only: back the TP q-proj shard by a view of the full-head weight.
+        alias_q_shard = is_npu()
+        n_aliased = 0
+        freed_bytes = 0
+        # reason -> list of layer ids; insertion order keeps the log stable.
+        skipped: dict = {}
+
+        def _skip(m, reason: str) -> None:
+            skipped.setdefault(reason, []).append(getattr(m, "layer_id", "?"))
+
         for m in self.model.modules():
             if not isinstance(m, DeepseekV2AttentionMLA):
                 continue
+            n_mla += 1
             if m.w_kc is None:
+                _skip(m, "w_kc not materialized (e.g. split GGUF kv_b)")
                 continue
             qp = m.q_b_proj if m.has_q_b_proj else m.q_proj
             # q-replicate only supports the unquantized bf16/fp16 absorb path;
             # quantized q-proj (packed weights) and non-16-bit w_kc keep the
             # per-layer Q all-gather.
-            if (
-                m.w_kc.dtype not in (torch.bfloat16, torch.float16)
-                or not isinstance(qp.quant_method, UnquantizedLinearMethod)
-                or qp.weight.dtype not in (torch.bfloat16, torch.float16)
-            ):
-                logger.warning(
-                    "dcp_replicate_q_proj: skipping quantized q-proj/w_kc "
-                    "(bf16/fp16 only); this layer keeps the Q all-gather."
+            if not isinstance(qp.quant_method, UnquantizedLinearMethod):
+                _skip(
+                    m, f"quantized q-proj ({type(qp.quant_method).__name__})"
                 )
                 continue
+            if qp.weight.dtype not in (torch.bfloat16, torch.float16):
+                _skip(m, f"q-proj weight dtype {qp.weight.dtype} (bf16/fp16 only)")
+                continue
+            if m.w_kc.dtype not in (torch.bfloat16, torch.float16):
+                _skip(m, f"w_kc dtype {m.w_kc.dtype} (bf16/fp16 only)")
+                continue
             m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
-            m.q_b_proj_qrep_weight = dcp_group.all_gather(
-                qp.weight.data.contiguous(), dim=0
-            )
+            shard = qp.weight.data
+            full = dcp_group.all_gather(shard.contiguous(), dim=0)
+            m.q_b_proj_qrep_weight = full
             n_prepared += 1
+            if alias_q_shard:
+                # The gathered full-head weight already contains this rank's
+                # shard as rows [rank * rows, (rank + 1) * rows); rebinding
+                # .data to that dim-0 slice view drops the duplicate copy
+                # (K3 TP8·DCP8 bf16: 12 heads x 192 x 1536 x 2 B ~= 6.75
+                # MiB/layer, x24 layers ~= 162 MiB per card). The Parameter
+                # object and its attributes are unchanged, so every existing
+                # forward / extend / prefill path is untouched. In-place weight
+                # updates after startup now write into the full-head tensor's
+                # slice, which is the desired shared behaviour. w_kc is left
+                # alone (K3 keeps it with a deliberate stride layout).
+                rows = shard.shape[0]
+                start = dcp_group.rank_in_group * rows
+                view = full[start : start + rows]
+                if torch.equal(view, shard):
+                    freed_bytes += shard.numel() * shard.element_size()
+                    qp.weight.data = view
+                    n_aliased += 1
+                else:
+                    logger.warning(
+                        "dcp_replicate_q_proj: layer %s full-head rows [%d, %d) "
+                        "do not match the local q-proj shard; keeping the "
+                        "separate shard copy.",
+                        getattr(m, "layer_id", "?"),
+                        start,
+                        start + rows,
+                    )
         logger.info(
-            "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
+            "dcp_replicate_q_proj: prepared full-head Q weights for %d/%d MLA "
+            "layers (dcp_size=%d); freed duplicate TP q-proj shards: %d "
+            "layers, %.2f MiB",
             n_prepared,
+            n_mla,
+            dcp_group.world_size,
+            n_aliased,
+            freed_bytes / (1 << 20),
         )
+        if skipped:
+            n_skipped = sum(len(v) for v in skipped.values())
+            details = "; ".join(
+                f"{reason}: layers {ids}" for reason, ids in skipped.items()
+            )
+            if n_prepared == 0:
+                logger.warning(
+                    "dcp_replicate_q_proj: replication is effectively disabled: "
+                    "all %d MLA layers skipped and keep the per-layer Q "
+                    "all-gather. %s",
+                    n_skipped,
+                    details,
+                )
+            else:
+                logger.warning(
+                    "dcp_replicate_q_proj: skipped %d/%d MLA layers; these keep "
+                    "the per-layer Q all-gather. %s",
+                    n_skipped,
+                    n_mla,
+                    details,
+                )
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         capture = capture_cuda_graphs(

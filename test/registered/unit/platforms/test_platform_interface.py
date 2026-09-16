@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.platforms import _load_platform_class, _resolve_platform
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
@@ -380,13 +381,34 @@ class TestNpuDeviceMixin(CustomTestCase):
             base.synchronize()
             mock_npu.synchronize.assert_called_once()
 
-    def test_pin_memory_available_for_npu_targets(self):
+    def test_pin_memory_follows_the_host_free_forward_switch(self):
+        # Pinned host memory turns every `.to(device, non_blocking=True)`
+        # staging copy into a real async copy. It rides the same switch as the
+        # host-free forward path instead of being unconditionally on, so the
+        # legacy path keeps the settled (pageable) mirrors it reads off the
+        # critical path.
         base = NPUSRTPlatform()
-        self.assertTrue(base.is_pin_memory_available())
-        self.assertTrue(base.is_pin_memory_available(device="npu"))
-        self.assertTrue(base.is_pin_memory_available(device=torch.device("npu", 0)))
-        self.assertFalse(base.is_pin_memory_available(device="cpu"))
-        self.assertFalse(base.is_pin_memory_available(device=torch.device("cpu")))
+        with envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.override(False):
+            self.assertTrue(base.is_pin_memory_available())
+            self.assertTrue(base.is_pin_memory_available(device="npu"))
+            self.assertTrue(base.is_pin_memory_available(device=torch.device("npu", 0)))
+            self.assertFalse(base.is_pin_memory_available(device="cpu"))
+            self.assertFalse(base.is_pin_memory_available(device=torch.device("cpu")))
+
+    def test_pin_memory_is_off_on_the_legacy_host_mirror_path(self):
+        # Default (SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=1): the platform
+        # reports no pinned memory, which is the behaviour every NPU
+        # deployment had before this platform class became reachable.
+        base = NPUSRTPlatform()
+        with envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.override(True):
+            self.assertFalse(base.is_pin_memory_available())
+            self.assertFalse(base.is_pin_memory_available(device="npu"))
+            self.assertFalse(base.is_pin_memory_available(device=torch.device("npu", 0)))
+            self.assertFalse(base.is_pin_memory_available(device="cpu"))
+
+    def test_pin_memory_default_matches_the_pre_platform_behaviour(self):
+        # No override: the shipped default must be the conservative one.
+        self.assertFalse(NPUSRTPlatform().is_pin_memory_available(device="npu"))
 
     def test_default_seed_everything_seeds_npu(self):
         mock_npu = MagicMock()

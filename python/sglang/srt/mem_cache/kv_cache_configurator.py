@@ -1738,6 +1738,12 @@ class KVCacheConfigurator:
                 or self.hybrid_gdn_config is not None
             ):
                 if self.is_hybrid_swa:
+                    if get_parallel().dcp_enabled:
+                        raise NotImplementedError(
+                            "Decode context parallel is not supported with a "
+                            "hybrid SWA KV pool on NPU: the SWA allocator is not "
+                            "widened to the DCP virtual location space."
+                        )
                     # DSV4 on NPU: SWA allocator subclass that also drives the
                     # c4/c128 allocators, producing a DSV4OutCacheLoc per alloc.
                     if is_dsv4_model:
@@ -1762,9 +1768,14 @@ class KVCacheConfigurator:
                         NPUPagedTokenToKVPoolAllocator,
                     )
 
+                    # Under DCP the allocator hands out virtual locs over
+                    # max_total * dcp_size with pages of page_size * dcp_size
+                    # (same as the CUDA branch below); the sharded NPU KV pool
+                    # stays physical and maps loc -> loc // dcp_size on write.
+                    dcp_scale = get_parallel().attn_dcp_size
                     token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
-                        sizes.max_total_num_tokens,
-                        page_size=get_schedule().page_size,
+                        sizes.max_total_num_tokens * dcp_scale,
+                        page_size=get_schedule().page_size * dcp_scale,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=token_to_kv_pool,

@@ -4,6 +4,7 @@ Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 
 import sys
 import unittest
+import unittest.mock
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -158,6 +159,7 @@ class TestForwardMetadata(unittest.TestCase):
             "swa_mask",
             "prefix_lens",
             "flatten_prefix_block_tables",
+            "dcp_local_seq_lens",
         }
         self.assertEqual(names, expected)
 
@@ -760,6 +762,150 @@ class TestCommonTemplate(unittest.TestCase):
         backend.common_template(forward_batch, call_fn)
         for call in call_fn.call_args_list:
             self.assertIs(call.args[1], forward_batch)
+
+
+class TestDcpDecodeHeadPadding(unittest.TestCase):
+    """_dcp_decode_fia passes the head count unpadded by default and pads it to
+    a power of 2 with SGLANG_NPU_DCP_PAD_HEADS=1; outputs are head slices."""
+
+    B, HEADS, C_DIM, R_DIM, PAGE = 2, 96, 16, 4, 4
+
+    def _run(self, pad_heads):
+        from sglang.srt.hardware_backend.npu.attention import (
+            ascend_backend as backend_mod,
+        )
+
+        backend = object.__new__(AscendAttnBackend)
+        backend.dcp_attn_impl = "fia"
+        backend.dcp_pad_heads = pad_heads
+        backend.graph_mode = False
+        backend.kv_lora_rank = self.C_DIM
+        backend.qk_rope_head_dim = self.R_DIM
+        backend.page_size = self.PAGE
+        backend.forward_metadata = SimpleNamespace(
+            dcp_local_seq_lens=[3, 0],
+            block_tables=torch.zeros(self.B, 1, dtype=torch.int32),
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_kv_buffer=lambda _: (
+                torch.zeros(8, 1, self.C_DIM),
+                torch.zeros(8, 1, self.R_DIM),
+            )
+        )
+        layer = SimpleNamespace(
+            tp_q_head_num=self.HEADS, tp_k_head_num=1, layer_id=0, scaling=1.0
+        )
+        calls = []
+
+        def fia_out(query, *args, out, **kwargs):
+            calls.append((tuple(query.shape), kwargs["num_heads"]))
+            out[0].copy_(torch.arange(query.shape[2]).view(1, 1, -1, 1))
+            out[1].copy_(torch.arange(query.shape[2]).view(1, -1, 1, 1))
+
+        fake_npu = MagicMock()
+        fake_npu.npu_fused_infer_attention_score.out.side_effect = fia_out
+        q = torch.randn(self.B, self.HEADS, self.C_DIM)
+        q_rope = torch.randn(self.B, self.HEADS, self.R_DIM)
+        with unittest.mock.patch.object(
+            backend_mod, "torch_npu", fake_npu
+        ), unittest.mock.patch.object(backend_mod, "is_fia_nz", return_value=False):
+            out, lse = backend._dcp_decode_fia(q, q_rope, layer)
+        self.assertEqual(out.shape, (self.B, self.HEADS, self.C_DIM))
+        self.assertEqual(lse.shape, (self.B, self.HEADS))
+        head_ids = torch.arange(self.HEADS).float()
+        self.assertTrue(torch.equal(lse, head_ids.expand(self.B, -1)))
+        self.assertTrue(torch.equal(out[..., 0], head_ids.expand(self.B, -1)))
+        return calls
+
+    def test_unpadded(self):
+        ((shape, num_heads),) = self._run(pad_heads=False)
+        self.assertEqual(num_heads, self.HEADS)
+        self.assertEqual(shape, (self.B, 1, self.HEADS, self.C_DIM))
+
+    def test_padded(self):
+        ((shape, num_heads),) = self._run(pad_heads=True)
+        self.assertEqual(num_heads, 128)
+        self.assertEqual(shape, (self.B, 1, 128, self.C_DIM))
+
+    def test_env_default(self):
+        from sglang.srt.environ import envs
+
+        self.assertFalse(envs.SGLANG_NPU_DCP_PAD_HEADS.get())
+        with envs.SGLANG_NPU_DCP_PAD_HEADS.override(True):
+            self.assertTrue(envs.SGLANG_NPU_DCP_PAD_HEADS.get())
+
+
+class TestDcpDraftLayout(unittest.TestCase):
+    """Under DCP the replicated draft pool (page size P * c, virtual locs) is
+    attended as dcp=1 with the physical page size P."""
+
+    def test_draft_worker_is_dcp1(self):
+        self.assertEqual(AscendAttnBackend._dcp_layout(True, 8, 3), (1, 0))
+        self.assertEqual(AscendAttnBackend._dcp_layout(False, 8, 3), (8, 3))
+        self.assertEqual(AscendAttnBackend._dcp_layout(True, 1, 0), (1, 0))
+        self.assertEqual(AscendAttnBackend._dcp_layout(False, 1, 0), (1, 0))
+        # NZ is only rejected for a DCP draft.
+        self.assertEqual(
+            AscendAttnBackend._dcp_layout(False, 8, 3, kv_is_nz=True), (8, 3)
+        )
+        with self.assertRaises(NotImplementedError):
+            AscendAttnBackend._dcp_layout(True, 8, 3, kv_is_nz=True)
+
+    def test_p_page_view_reads_virtual_locs(self):
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+
+        P, c, H, D = 4, 3, 2, 5
+        stride = P * c
+        seq_lens = [1, 13, 30, 12]
+        num_pages = sum((n + stride - 1) // stride for n in seq_lens) + 2
+        allocator = PagedTokenToKVPoolAllocator(
+            size=num_pages * stride,
+            page_size=stride,
+            dtype=torch.float32,
+            device="cpu",
+            kvcache=object(),
+            need_sort=False,
+        )
+        g = torch.Generator().manual_seed(0)
+        allocator.free_pages = allocator.free_pages[
+            torch.randperm(len(allocator.free_pages), generator=g)
+        ]
+        max_len = (max(seq_lens) + stride - 1) // stride * stride
+        req_to_token = torch.zeros(len(seq_lens), max_len, dtype=torch.int64)
+        # NPUMHATokenToKVPool buffer built with pool_page_size = P * c.
+        k_buffer = torch.zeros(num_pages * stride // stride + 1, stride, H, D)
+        values = []
+        for i, n in enumerate(seq_lens):
+            need = (n + stride - 1) // stride * stride
+            req_to_token[i, :need] = allocator.alloc(need)
+            vals = torch.randn(n, H, D, generator=g)
+            k_buffer.view(-1, H, D)[req_to_token[i, :n]] = vals
+            values.append(vals)
+
+        backend = object.__new__(AscendAttnBackend)
+        backend.page_size = P
+        backend.dcp_size = 1
+        # Plain dcp=1 metadata / K/V view of the draft backend.
+        block_tables = req_to_token[:, ::P] // P
+        k_cache = k_buffer.view(-1, backend.page_size, H * D)
+        for i, n in enumerate(seq_lens):
+            pages = block_tables[i, : (n + P - 1) // P]
+            rows = k_cache[pages].reshape(-1, H, D)[:n]
+            self.assertTrue(torch.equal(rows, values[i]), i)
+
+    def test_graph_block_tables_use_physical_page_size(self):
+        backend = object.__new__(AscendAttnBackend)
+        backend.dcp_size = 1
+        backend.page_size = 4
+        backend.max_context_len = 64
+        backend.speculative_num_draft_tokens = 8
+        backend.device = "cpu"
+        backend.is_hybrid_swa = False
+        backend.use_sliding_window_kv_pool = False
+        backend.init_cuda_graph_state(max_bs=3, max_num_tokens=24)
+        self.assertEqual(
+            backend.graph_metadata["block_tables"].shape, (3, (64 + 3 + 8) // 4)
+        )
 
 
 if __name__ == "__main__":

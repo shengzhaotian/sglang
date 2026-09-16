@@ -266,6 +266,23 @@ def declare_direct_writes(
     return result
 
 
+_NO_DEFAULT = object()
+
+
+def _declared_default(cls, field: str) -> Any:
+    """The value ``cls.__init__`` would give ``field``, or ``_NO_DEFAULT``."""
+    if not dataclasses.is_dataclass(cls):
+        return _NO_DEFAULT
+    for f in dataclasses.fields(cls):
+        if f.name != field:
+            continue
+        if f.default is not dataclasses.MISSING:
+            return f.default
+        if f.default_factory is not dataclasses.MISSING:
+            return f.default_factory()
+    return _NO_DEFAULT
+
+
 def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
     """What resolution decided for ``field``: the declaration if there is one,
     otherwise what the caller supplied.
@@ -284,6 +301,18 @@ def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
     raw = getattr(server_args, "_raw_input", None)
     if raw is not None and field in raw:
         return raw[field]
+    if not hasattr(server_args, field):
+        # A record restored from a state that predates this field carries the
+        # class's fields but not their values: unpickling a dataclass replaces
+        # __dict__ and never runs __init__, so a field added since the state
+        # was written has no value even though the class declares it. Answer
+        # with what __init__ would have set. Without this the whole publish
+        # fails in _build_config_bags -- for a field the operator never
+        # touched, and only when no resolver happened to declare it, which is
+        # how `--mamba-prefill-checkpoint-at` "fixed" a startup crash.
+        declared = _declared_default(type(server_args), field)
+        if declared is not _NO_DEFAULT:
+            return declared
     return getattr(server_args, field, default)
 
 

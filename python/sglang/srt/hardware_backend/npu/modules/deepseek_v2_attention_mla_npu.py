@@ -16,7 +16,9 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
+from sglang.srt.layers.dcp.comm import all_gather_q_for_mla_decode
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -78,6 +80,13 @@ def forward_mha_prepare_npu(
     latent_cache = latent_cache.unsqueeze(1)
 
     if m.use_deepseek_yarn_rope:
+        if get_parallel().dcp_enabled:
+            # npu_kv_rmsnorm_rope_cache writes out_cache_loc directly and would
+            # bypass the DCP owner filter in NPUMLATokenToKVPool.set_kv_buffer.
+            raise NotImplementedError(
+                "Decode context parallel is not supported with the NPU fused "
+                "yarn-rope KV cache write (rope_scaling is set)."
+            )
         B, S = q.shape[0], 1
         cos, sin = m.rotary_emb.get_cos_sin_cache(
             positions, hidden_states.dtype, offsets=None
@@ -152,6 +161,44 @@ def forward_mha_core_npu(
 
 
 # region MLA
+def _use_triton_split_qk_norm(m, qkv_latent, forward_batch) -> bool:
+    """Whether the in-tree Triton-Ascend split + q/k RMSNorm kernel applies.
+
+    It replaces ``split`` + two implicit ``contiguous`` + two ``npu_rms_norm``
+    by reading the strided slices of the fused ``qkv_a_proj`` output in place.
+    Off by default (SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON): unlike the vendor
+    fused kernel it keeps the reference arithmetic, but it still has to be
+    checked element-wise against ``npu_rms_norm`` on device first.
+    """
+    if not envs.SGLANG_NPU_FUSED_SPLIT_QK_NORM_TRITON.get():
+        return False
+    if qkv_latent.dim() != 2 or qkv_latent.stride(1) != 1:
+        return False
+    if dsa_use_prefill_cp(forward_batch):
+        # This path keeps latent_cache for rebuild_cp_kv_cache.
+        return False
+    for norm in (m.q_a_layernorm, m.kv_a_layernorm):
+        if (
+            not getattr(norm, "has_weight", False)
+            or getattr(norm, "variance_size_override", None) is not None
+            or getattr(norm, "cast_x_before_out_mul", False)
+            or getattr(norm, "override_orig_dtype", None) is not None
+            or norm.weight.dim() != 1
+        ):
+            return False
+    return True
+
+
+def _is_npu_dcp_mla_full_heads(forward_batch: "ForwardBatch") -> bool:
+    # DCP decode and DSPARK target verify attend with all num_heads * dcp heads
+    # through attn_mqa_for_dcp_decode; the Ascend backend merges the partials
+    # across DCP ranks and returns this rank's heads.
+    return get_parallel().dcp_enabled and (
+        forward_batch.forward_mode.is_decode()
+        or forward_batch.forward_mode.is_target_verify()
+    )
+
+
 def forward_mla_prepare_npu(
     m: "DeepseekV2AttentionMLA",
     positions: torch.Tensor,
@@ -189,6 +236,17 @@ def forward_mla_prepare_npu(
         topk_indices = None
     else:
         q_lora = None
+        dcp_full_heads = _is_npu_dcp_mla_full_heads(forward_batch)
+        # --dcp-replicate-q-proj: project full-head Q from the pre-gathered
+        # weights (model_runner._prepare_replicated_q_proj) instead of the
+        # per-layer Q all-gather; layers without them keep the all-gather.
+        q_replicate_active = (
+            dcp_full_heads
+            and m.q_b_proj_qrep_weight is not None
+            and m.w_kc_qrep is not None
+        )
+        if q_replicate_active:
+            num_q_heads = m.num_local_heads * get_parallel().attn_dcp_size
         if m.q_lora_rank is not None:
             qkv_latent = get_attn_tp_context().fetch_qkv_latent()
             if (
@@ -209,7 +267,22 @@ def forward_mla_prepare_npu(
                 k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
                 k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
             else:
-                if (
+                if _use_triton_split_qk_norm(m, qkv_latent, forward_batch):
+                    from sglang.srt.hardware_backend.npu.triton_ops.split_qk_norm import (
+                        split_qk_rmsnorm,
+                    )
+
+                    q, k_nope, k_pe = split_qk_rmsnorm(
+                        qkv_latent,
+                        m.q_a_layernorm.weight.data,
+                        m.kv_a_layernorm.weight.data,
+                        m.q_lora_rank,
+                        m.kv_lora_rank,
+                        m.qk_rope_head_dim,
+                        m.q_a_layernorm.variance_epsilon,
+                        m.kv_a_layernorm.variance_epsilon,
+                    )
+                elif (
                     qkv_latent.shape[0] < 65536
                     and not dsa_use_prefill_cp(forward_batch)
                     and not getattr(m, "_disable_npu_fused_split_qk_norm", False)
@@ -241,9 +314,21 @@ def forward_mla_prepare_npu(
             if m.use_dsa:
                 q_lora = q
 
-            q = m.q_b_proj(q)[0].view(-1, m.num_local_heads, m.qk_head_dim)
+            if q_replicate_active:
+                q = torch.nn.functional.linear(q, m.q_b_proj_qrep_weight).view(
+                    -1, num_q_heads, m.qk_head_dim
+                )
+            else:
+                q = m.q_b_proj(q)[0].view(-1, m.num_local_heads, m.qk_head_dim)
         else:
-            q = m.q_proj(hidden_states)[0].view(-1, m.num_local_heads, m.qk_head_dim)
+            if q_replicate_active:
+                q = torch.nn.functional.linear(
+                    hidden_states, m.q_b_proj_qrep_weight
+                ).view(-1, num_q_heads, m.qk_head_dim)
+            else:
+                q = m.q_proj(hidden_states)[0].view(
+                    -1, m.num_local_heads, m.qk_head_dim
+                )
             latent_cache = m.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : m.kv_lora_rank]
             k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
@@ -251,12 +336,19 @@ def forward_mla_prepare_npu(
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
-        q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
+        q_nope_out = torch.bmm(
+            q_nope.transpose(0, 1), m.w_kc_qrep if q_replicate_active else m.w_kc
+        )
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+
+        if dcp_full_heads and not q_replicate_active:
+            # [B, H, *] -> [B, H * dcp, *]: every DCP rank attends with all heads
+            # (--no-dcp-replicate-q-proj, or layers whose Q cannot be replicated).
+            q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
 
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -300,15 +392,27 @@ def forward_mla_core_npu(
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    attn_output = m.attn_mqa(
-        q_nope_out,
-        k_nope,
-        k_nope,
-        forward_batch,
-        q_rope=q_pe,
-        k_rope=k_pe,
-        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-    )
+    if _is_npu_dcp_mla_full_heads(forward_batch):
+        # Full-head Q over this rank's KV shard; the backend returns this
+        # rank's heads merged across DCP ranks ([T, H * kv_lora_rank]).
+        attn_output = m.attn_mqa_for_dcp_decode(
+            q_nope_out,
+            k_nope,
+            k_nope,
+            forward_batch,
+            q_rope=q_pe,
+            k_rope=k_pe,
+        )
+    else:
+        attn_output = m.attn_mqa(
+            q_nope_out,
+            k_nope,
+            k_nope,
+            forward_batch,
+            q_rope=q_pe,
+            k_rope=k_pe,
+            **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+        )
 
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 

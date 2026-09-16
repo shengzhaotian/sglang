@@ -435,6 +435,69 @@ class TestGetDcpLens(CustomTestCase):
         self.assertEqual(dcp4_allocator.page_size, 256)
         self.assertEqual(dcp4_allocator.num_pages, 16)
 
+    def _build_npu_ascend_allocator(self, *, dcp_size: int, is_hybrid_swa: bool):
+        physical_kv_cache = SimpleNamespace(size=1024, page_size=64)
+        sizes = SimpleNamespace(
+            max_total_num_tokens=1024,
+            full_max_total_num_tokens=1024,
+            swa_max_total_num_tokens=1024,
+        )
+        configurator = SimpleNamespace(
+            server_args=SimpleNamespace(),
+            hybrid_gdn_config=None,
+            is_hybrid_swa=is_hybrid_swa,
+            kv_cache_dtype=torch.bfloat16,
+            device="cpu",
+            is_draft_worker=False,
+        )
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator.current_platform.is_out_of_tree",
+            return_value=False,
+        ), patch(
+            "sglang.srt.mem_cache.kv_cache_configurator._is_npu", True
+        ), rc.get_parallel().override(
+            dcp_enabled=dcp_size > 1, attn_dcp_size=dcp_size
+        ):
+            return KVCacheConfigurator._build_token_to_kv_pool_allocator(
+                configurator,
+                sizes=sizes,
+                token_to_kv_pool=physical_kv_cache,
+                is_dsv4_model=False,
+                req_to_token_pool=object(),
+                token_to_kv_pool_allocator=None,
+            )
+
+    def test_npu_ascend_configurator_widens_the_dcp_allocator(self):
+        """The NPU/ascend branch must build the same virtual allocator as CUDA:
+        pool write filter (loc // c), block-table stride P * c, radix page size
+        and the scheduler's x dcp capacity all assume it."""
+        from sglang.srt.hardware_backend.npu.allocator_npu import (
+            NPUPagedTokenToKVPoolAllocator,
+        )
+
+        override = rc.get_context().override_server_args(
+            disaggregation_mode="null",
+            page_size=64,
+            attention_backend="ascend",
+            enable_hisparse=False,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        for dcp_size, size, page_size in ((1, 1024, 64), (4, 4096, 256)):
+            allocator = self._build_npu_ascend_allocator(
+                dcp_size=dcp_size, is_hybrid_swa=False
+            )
+            self.assertIsInstance(allocator, NPUPagedTokenToKVPoolAllocator)
+            self.assertEqual(allocator.size, size)
+            self.assertEqual(allocator.page_size, page_size)
+            self.assertEqual(allocator.roundup, page_size - 1)
+            self.assertEqual(allocator.num_pages, 16)
+
+        # Hybrid SWA has no widened NPU allocator: fail loudly under DCP.
+        with self.assertRaisesRegex(NotImplementedError, "hybrid SWA"):
+            self._build_npu_ascend_allocator(dcp_size=4, is_hybrid_swa=True)
+
     def test_live_cell_and_page_ownership_formulas(self):
         dcp_size = 4
         physical_page_size = 64
@@ -501,6 +564,51 @@ class TestGetDcpLens(CustomTestCase):
 
         self.assertEqual(pool.get_kv_buffer_shape(), expected)
         pool.full_kv_pool.get_kv_buffer_shape.assert_called_once_with()
+
+
+class TestEagerRunnerDcpMetadata(CustomTestCase):
+    """EagerRunner._execute_extend builds the CUDA DCP prefix metadata only off
+    NPU: the Ascend backend gathers the prefix itself and never reads
+    attn_dcp_metadata."""
+
+    def _run(self, npu: bool, dcp_size: int):
+        from sglang.srt.model_executor.runner import eager_runner as er
+
+        runner = object.__new__(er.EagerRunner)
+        runner.enable_pdmux = True  # skip load_batch's static buffers
+        mr = MagicMock()
+        mr.ps.attn_dcp_size = dcp_size
+        mr.device = "cpu"
+        mr.device_timer = None
+        mr.prefill_cuda_graph_runner = None
+        mr.model.forward.return_value = "out"
+        runner.model_runner = mr
+        fb = MagicMock()
+        fb.needs_forward_metadata_init.return_value = True
+        fb.forward_mode.is_target_verify.return_value = False
+        fb.attn_dcp_metadata = None
+        with patch.object(er, "is_npu", return_value=npu), patch.object(
+            er, "is_cp_v2_active", return_value=False
+        ), patch.object(er, "get_req_to_token_pool"), patch.object(
+            er, "get_token_to_kv_pool"
+        ), patch.object(
+            er, "maybe_publish_prefill_shared_read_done"
+        ):
+            self.assertEqual(runner._execute_extend(fb), "out")
+        mr.attn_backend.init_forward_metadata.assert_called_once_with(fb)
+        return mr.model.prepare_context_parallel_metadata_for_dcp, fb
+
+    def test_npu_skips_cuda_dcp_metadata(self):
+        prepare, fb = self._run(npu=True, dcp_size=8)
+        prepare.assert_not_called()
+        self.assertIsNone(fb.attn_dcp_metadata)
+
+    def test_cuda_still_builds_dcp_metadata(self):
+        prepare, fb = self._run(npu=False, dcp_size=8)
+        prepare.assert_called_once()
+        self.assertIs(fb.attn_dcp_metadata, prepare.return_value)
+        prepare, _ = self._run(npu=False, dcp_size=1)
+        prepare.assert_not_called()
 
 
 if __name__ == "__main__":

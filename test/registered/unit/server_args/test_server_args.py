@@ -46,6 +46,7 @@ from sglang.srt.arg_groups.moe_hook import (
 )
 from sglang.srt.arg_groups.overrides import (
     cutedsl_moe_max_num_tokens,
+    declare_resolution,
     max_speculative_num_draft_tokens,
     record_of,
     resolution_result,
@@ -3011,6 +3012,63 @@ class TestDcpKvEventContract(CustomTestCase):
 
         args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
         self.assertEqual(kv_event_block_size_of(resolving_view(args)), 8)
+
+
+
+class TestResolutionSurvivesAnOlderRecord(CustomTestCase):
+    """A record restored from a state that predates one of its fields must
+    still publish.
+
+    Unpickling a dataclass replaces ``__dict__`` and never runs ``__init__``,
+    so an instance written by an older ServerArgs carries the current class's
+    fields without their values. ``_build_config_bags`` projects every
+    NS-declared field and used to fail the whole publish on the first such
+    miss -- for a field the operator never touched, and only when no resolver
+    happened to declare it, so passing an unrelated flag (e.g.
+    ``--mamba-prefill-checkpoint-at``, whose validator declares the derived
+    positions) made the crash disappear.
+
+    The rest of this file's resolution cases use ``SimpleNamespace`` doubles,
+    which carry no ``Arg`` metadata and skip the whitelist and the projection
+    entirely; only a real ``ServerArgs`` reaches this path.
+    """
+
+    FIELD = "mamba_prefill_checkpoint_positions"
+
+    def _aged_record(self):
+        server_args = ServerArgs(model_path="dummy")
+        self.assertIn(
+            self.FIELD,
+            {f.name for f in dataclasses.fields(ServerArgs)},
+            "the field this case is about was renamed or removed",
+        )
+        server_args.__dict__.pop(self.FIELD, None)
+        return server_args
+
+    def test_the_projection_answers_with_the_declared_default(self):
+        from sglang.srt.runtime_context import _build_config_bags
+
+        bags = _build_config_bags(self._aged_record())
+        self.assertEqual(getattr(bags["exec"].mamba, self.FIELD), [])
+
+    def test_a_default_factory_is_not_shared_between_records(self):
+        first = resolution_result(self._aged_record(), self.FIELD)
+        first.append(136192)
+        self.assertEqual(resolution_result(self._aged_record(), self.FIELD), [])
+
+    def test_a_declaration_still_wins_over_the_default(self):
+        server_args = self._aged_record()
+        declare_resolution(
+            server_args,
+            "validate_mamba_extra_buffer",
+            **{self.FIELD: [136192]},
+        )
+        self.assertEqual(resolution_result(server_args, self.FIELD), [136192])
+
+    def test_an_intact_record_is_unaffected(self):
+        server_args = ServerArgs(model_path="dummy")
+        setattr(server_args, self.FIELD, [65536])
+        self.assertEqual(resolution_result(server_args, self.FIELD), [65536])
 
 
 if __name__ == "__main__":

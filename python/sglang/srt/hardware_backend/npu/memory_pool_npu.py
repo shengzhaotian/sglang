@@ -8,6 +8,7 @@ from sglang.srt.hardware_backend.npu.attention.fp8_contracts import (
     DSA_KV_QUANT_TILE_SIZE,
     get_dsa_fp8_packed_cache_dim,
 )
+from sglang.srt.hardware_backend.npu.dcp.ops import dcp_physical_write_loc
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -16,6 +17,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_npu
 
@@ -576,6 +578,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         # write into the NZ-addressed view below so ordinary MLA (including
         # Kimi-K3 MTP) can use FIA NZ without MLAPO.
         self.use_fia_nz = get_bool_env_var("SGLANG_USE_FIA_NZ")
+        # One Triton-Ascend kernel for the DCP owner filter + both cache writes.
+        self.use_triton_dcp_kv_store = envs.SGLANG_NPU_DCP_KV_STORE_TRITON.get()
         super(MLATokenToKVPool, self).__init__(
             size=size,
             page_size=page_size,
@@ -848,6 +852,28 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
+        parallel = get_parallel()
+        if (
+            parallel.dcp_enabled
+            and self.use_triton_dcp_kv_store
+            and not self.dsa_kv_cache_store_fp8
+            and not self.use_fia_nz
+        ):
+            self._set_dcp_kv_buffer_triton(
+                layer_id,
+                loc,
+                cache_k,
+                cache_v,
+                parallel.attn_dcp_size,
+                parallel.attn_dcp_rank,
+            )
+            return
+        if parallel.dcp_enabled:
+            # Virtual loc -> this rank's physical slot; tokens owned by other
+            # DCP ranks are written to the reserved slot 0 (static shape).
+            loc = dcp_physical_write_loc(
+                loc, parallel.attn_dcp_size, parallel.attn_dcp_rank
+            )
 
         if self.dsa_kv_cache_store_fp8:
             if cache_v is None:
@@ -892,6 +918,46 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ),
             loc.view(-1, 1),
             cache_v.view(-1, 1, self.qk_rope_head_dim),
+        )
+
+    def _set_dcp_kv_buffer_triton(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        dcp_size: int,
+        dcp_rank: int,
+    ) -> None:
+        """Owner filter + both MLA cache writes in one Triton-Ascend kernel.
+
+        ``loc`` stays in virtual (pre-shard) space: the kernel keeps the tokens
+        with ``loc % dcp_size == dcp_rank``, writes them to ``loc // dcp_size``,
+        and stores nothing for the rest -- so unlike the torch path there is no
+        dummy write to the reserved slot 0.
+        """
+        from sglang.srt.hardware_backend.npu.triton_ops.kv_store import (
+            dcp_store_mla_kv,
+        )
+
+        if cache_v is None:
+            cache_k, cache_v = cache_k.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+        dcp_store_mla_kv(
+            self.k_buffer[layer_id - self.start_layer].view(-1, self.kv_lora_rank),
+            self.v_buffer[layer_id - self.start_layer].view(-1, self.qk_rope_head_dim),
+            cache_k,
+            cache_v,
+            loc,
+            dcp_size,
+            dcp_rank,
         )
 
     def _set_fia_nz_kv_buffer(
@@ -972,7 +1038,31 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ]
         return buffers
 
+    @staticmethod
+    def _dcp_physical_indices(indices):
+        """Virtual (allocator) locs -> this rank's physical slots under DCP.
+
+        Tokens owned by other DCP ranks map to the reserved pad slot 0, so a
+        backup / restore of the same positions round-trips this rank's shard
+        (slot 0 only ever holds dummy writes)."""
+        parallel = get_parallel()
+        if not parallel.dcp_enabled:
+            return indices
+        return dcp_physical_write_loc(
+            torch.as_tensor(indices), parallel.attn_dcp_size, parallel.attn_dcp_rank
+        )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if get_parallel().dcp_enabled:
+            raise NotImplementedError(
+                "NPUMLATokenToKVPool.move_kv_cache is not supported under decode "
+                "context parallel: KV relocation (EAGLE topk > 1 / compact "
+                "verify) is not wired for the DCP-sharded layout."
+            )
+        return super().move_kv_cache(tgt_loc, src_loc)
+
     def get_cpu_copy(self, indices, mamba_indices=None):
+        indices = self._dcp_physical_indices(indices)
         torch.npu.synchronize()
         buf_of_layers = [
             self._get_cpu_offload_layer_buffers(i) for i in range(self.layer_num)
@@ -982,6 +1072,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        indices = self._dcp_physical_indices(indices)
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):

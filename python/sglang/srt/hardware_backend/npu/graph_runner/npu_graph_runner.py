@@ -42,7 +42,12 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.dcp.ops import (
+    dcp_local_seq_lens,
+    dcp_verify_history_local_lens,
+)
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
@@ -161,10 +166,25 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             out = run_once_fn()
         return out
 
+    def _is_dcp_target(self):
+        # DCP shards the target KV only; the draft attends its replicated pool
+        # as dcp=1.
+        return get_parallel().dcp_enabled and not self.model_runner.is_draft_worker
+
+    def _is_dcp_target_verify_graph(self):
+        # DCP target verify: the MLA history FIA v1 reads this rank's history
+        # lengths via actual_seq_lengths_kv, while the current-window FIAS v2
+        # call keeps actual_seq_kvlen=[w]*bs baked at capture.
+        return self._is_dcp_target() and self.capture_forward_mode.is_target_verify()
+
     def _uses_v2_seq_len_update(self):
         # IDLE DP ranks replay the same target-verify graph as active ranks.
         # Select the handler from the captured graph, not the runtime mode;
         # a V1 update key is ignored by V2 and leaves stale KV lengths behind.
+        if self._is_dcp_target_verify_graph():
+            # The V1 update key rebinds only the history FIA v1 ops; the
+            # current FIAS v2 ops (actual_seq_kvlen=[w]*bs) stay as captured.
+            return False
         return self.if_use_v2 or (
             self.use_fias_v2_bsnd and self.capture_forward_mode.is_target_verify()
         )
@@ -262,10 +282,27 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                         forward_batch.seq_lens.cpu() + self.captured_req_width
                     )
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+                if self._is_dcp_target_verify_graph():
+                    # seq_lens count the verify window; the history FIA reads
+                    # this rank's shard of the prefix before it (padding 0).
+                    parallel = get_parallel()
+                    seq_lens = dcp_verify_history_local_lens(
+                        seq_lens,
+                        self.captured_req_width,
+                        parallel.attn_dcp_size,
+                        parallel.attn_dcp_rank,
+                    )
             else:
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
                 )
+                if self._is_dcp_target():
+                    # DCP MLA decode reads only this rank's KV shard (padding
+                    # rows stay 0).
+                    parallel = get_parallel()
+                    seq_lens = dcp_local_seq_lens(
+                        seq_lens, parallel.attn_dcp_size, parallel.attn_dcp_rank
+                    )
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,

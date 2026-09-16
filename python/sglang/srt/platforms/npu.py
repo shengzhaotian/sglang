@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import (
     DeviceCapability,
     DeviceMixin,
@@ -58,7 +59,15 @@ class NPUDeviceMixin(DeviceMixin):
     def is_pin_memory_available(self, device=None) -> bool:
         if device is not None and str(device) == "cpu":
             return False
-        return True
+        # Pinned host memory is what makes a `.to(device, non_blocking=True)`
+        # staging copy genuinely asynchronous; with pageable memory the same
+        # call completes before it returns. That asynchrony belongs to the
+        # host-free forward path (SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0),
+        # which fences its host mirrors with events. The legacy path reads
+        # those mirrors straight off the critical path and needs them already
+        # settled, so it keeps the copies pageable -- the behaviour every NPU
+        # deployment had before this platform class became reachable.
+        return not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get()
 
     @classmethod
     def seed_everything(cls, seed: int | None = None) -> None:
