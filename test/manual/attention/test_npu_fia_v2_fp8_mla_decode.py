@@ -104,7 +104,6 @@ class CaseInputs:
     dequant_scale_query: torch.Tensor
     dequant_scale_kv: torch.Tensor
     attention_mask: torch.Tensor | None
-    actual_seq_qlen: list[int]
     actual_seq_kvlen: list[int]
 
 
@@ -215,7 +214,6 @@ def build_case(config: CaseConfig) -> CaseInputs:
         dequant_scale_query=dequant_scale_query.contiguous(),
         dequant_scale_kv=dequant_scale_kv,
         attention_mask=attention_mask,
-        actual_seq_qlen=[config.query_seq_len] * config.batch_size,
         actual_seq_kvlen=[config.total_kv_len] * config.batch_size,
     )
 
@@ -234,7 +232,6 @@ def move_case(inputs: CaseInputs, device: torch.device) -> CaseInputs:
             if inputs.attention_mask is not None
             else None
         ),
-        actual_seq_qlen=inputs.actual_seq_qlen,
         actual_seq_kvlen=inputs.actual_seq_kvlen,
     )
 
@@ -302,7 +299,8 @@ def run_fia_v2(inputs: CaseInputs, config: CaseConfig) -> torch.Tensor:
         query_rope=query_rope,
         key_rope=inputs.key_rope_cache,
         atten_mask=inputs.attention_mask,
-        actual_seq_qlen=inputs.actual_seq_qlen,
+        # CANN's IFA MLA path requires actualSeqLengthsQ to be empty for
+        # non-TND layouts.  BSND obtains Sq directly from query.shape[1].
         actual_seq_kvlen=inputs.actual_seq_kvlen,
         block_table=inputs.block_table,
         dequant_scale_query=dequant_scale_query,
@@ -352,7 +350,6 @@ def run_fia_v2_stepwise(inputs: CaseInputs, config: CaseConfig) -> torch.Tensor:
                 :, query_index : query_index + 1
             ],
             attention_mask=None,
-            actual_seq_qlen=[1] * config.batch_size,
             actual_seq_kvlen=[config.seq_len + query_index + 1]
             * config.batch_size,
         )
