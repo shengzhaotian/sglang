@@ -196,6 +196,22 @@ def move_case(inputs: CaseInputs, device: torch.device) -> CaseInputs:
     )
 
 
+def _gather_pa_pages(cache: torch.Tensor, page_ids: torch.Tensor) -> torch.Tensor:
+    """Gather ``[B, P]`` physical pages without FP8 advanced indexing.
+
+    Ascend ``aclnnIndex`` does not accept FLOAT8_E4M3FN as ``self``. FP8 and
+    UINT8 have the same element size, so gathering the bit-view with
+    ``index_select`` preserves every payload bit and can safely be viewed back.
+    """
+    batch, pages = page_ids.shape
+    flat_ids = page_ids.reshape(-1).to(torch.int64)
+    if cache.dtype == FP8_DTYPE:
+        gathered = torch.index_select(cache.view(torch.uint8), 0, flat_ids)
+        return gathered.view(FP8_DTYPE).reshape(batch, pages, *cache.shape[1:])
+    gathered = torch.index_select(cache, 0, flat_ids)
+    return gathered.reshape(batch, pages, *cache.shape[1:])
+
+
 @torch.no_grad()
 def run_fia_v2(inputs: CaseInputs, config: CaseConfig) -> torch.Tensor:
     """Run the production FIA v2 FP8 MLA paged-decode operator once."""
@@ -269,10 +285,10 @@ def native_fullquant_mla_reference(
 
     for page_start in range(0, config.pages_per_request, pages_per_chunk):
         page_end = min(page_start + pages_per_chunk, config.pages_per_request)
-        page_ids = inputs.block_table[:, page_start:page_end].long()
+        page_ids = inputs.block_table[:, page_start:page_end]
 
-        latent = inputs.latent_cache[page_ids].float()
-        key_rope = inputs.key_rope_cache[page_ids].float()
+        latent = _gather_pa_pages(inputs.latent_cache, page_ids).float()
+        key_rope = _gather_pa_pages(inputs.key_rope_cache, page_ids).float()
         logical_start = page_start * config.block_size
         valid_tokens = min(
             config.seq_len - logical_start,
