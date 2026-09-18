@@ -6,6 +6,7 @@ accuracy or device-kernel tests.
 """
 
 import ast
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -31,7 +32,14 @@ BACKEND = next(
 
 
 def _load_backend(fia_v2):
-    methods = {"_forward_mla_fp8", "forward_decode", "forward_extend", "forward_mtp"}
+    methods = {
+        "_forward_mla_fp8",
+        "forward_decode",
+        "forward_extend",
+        "forward_mtp",
+        "_init_cuda_graph_metadata",
+        "_apply_cuda_graph_metadata",
+    }
     cls = ast.ClassDef(
         name="Backend",
         bases=[],
@@ -54,6 +62,11 @@ def _load_backend(fia_v2):
                 ast.ImportFrom(
                     module="__future__", names=[ast.alias(name="annotations")], level=0
                 ),
+                next(
+                    n
+                    for n in TREE.body
+                    if isinstance(n, ast.ClassDef) and n.name == "ForwardMetadata"
+                ),
                 reshape,
                 cls,
             ],
@@ -62,6 +75,7 @@ def _load_backend(fia_v2):
     )
     namespace = {
         "torch": torch,
+        "dataclass": dataclass,
         "np": np,
         "torch_npu": SimpleNamespace(
             npu_fused_infer_attention_score_v2=SimpleNamespace(out=fia_v2)
@@ -182,14 +196,138 @@ def test_empty_dp_rank_skips_fia():
 
 @pytest.mark.parametrize(
     "attribute,value",
-    [("graph_mode", True), ("use_sparse_attn_a2a", True), ("attn_cp_size", 2)],
+    [("use_sparse_attn_a2a", True), ("attn_cp_size", 2)],
 )
 def test_unsupported_c8_parallel_paths_fail_explicitly(attribute, value):
     backend, _, fia, args = _case()
     setattr(backend, attribute, value)
-    with pytest.raises(NotImplementedError, match="eager, non-CP/non-A2A"):
+    with pytest.raises(NotImplementedError, match="non-CP/non-A2A"):
         backend.forward_decode(**args)
     fia.assert_not_called()
+
+
+@pytest.mark.parametrize("bucket", [8, 16])
+@pytest.mark.parametrize("width", [1, 3])
+@pytest.mark.parametrize("live_requests", [0, 5])
+def test_c8_graph_keeps_bucket_shape_for_q_scale_and_output(
+    bucket, width, live_requests
+):
+    backend, _, fia, args = _case(
+        tokens=bucket * width, live=live_requests * width, width=width
+    )
+    backend.graph_mode = True
+    fm = backend.forward_metadata
+    fm.seq_lens_cpu_int = None
+    # Capture-time lengths are placeholders. The runner updates the captured
+    # FIA node's host lengths on replay, not Python's live-token slicing.
+    fm.seq_lens_cpu_list = [0] * bucket
+    fm.block_tables = torch.zeros(bucket, 3, dtype=torch.int32)
+    if width == 1:
+        output = backend.forward_decode(**args)
+        shape, scale_shape, qlen = (bucket, 1, 12, 512), (bucket, 1, 12), None
+    else:
+        output = backend.forward_extend(**args)
+        shape, scale_shape = (bucket * width, 12, 512), (bucket * width, 12)
+        qlen = list(range(width, bucket * width + 1, width))
+    q, k, v = fia.call_args.args
+    kw = fia.call_args.kwargs
+    assert q.shape == shape and q.dtype == torch.float8_e4m3fn
+    assert k is v and k.dtype == torch.float8_e4m3fn
+    assert kw["dequant_scale_query"].shape == scale_shape
+    assert kw["dequant_scale_query"].dtype == torch.float32
+    assert kw["actual_seq_qlen"] == qlen
+    assert kw["actual_seq_kvlen"] == [0] * bucket
+    assert kw["block_table"].data_ptr() == fm.block_tables.data_ptr()
+    assert kw["out"][0].dtype == torch.bfloat16
+    assert output.shape == (bucket * width, 12 * 512)
+    assert kw["out"][0].data_ptr() == output.data_ptr()
+
+
+def _graph_metadata_case(width):
+    backend, ns, _fia, args = _case(tokens=8 * width, width=width)
+    backend.speculative_num_draft_tokens = width
+    backend.is_hybrid_swa = backend.use_sliding_window_kv_pool = False
+    backend.needs_cpu_seq_lens = True
+    backend.use_fias_v2_bsnd = False
+    backend.speculative_step_id = 0
+    backend.speculative_step_offset_npu = torch.tensor(1, dtype=torch.int32)
+    backend.tp_q_head_num = 12
+    backend.graph_metadata = {"block_tables": torch.zeros(16, 4, dtype=torch.int32)}
+    backend.req_to_token = torch.arange(9 * 512).view(9, 512)
+    backend.req_to_token[0].zero_()
+    ns["_is_dflash_verify"] = lambda spec: spec is not None
+    ns["flash_mla_with_kvcache_metadata"] = Mock(
+        return_value=torch.zeros(4096, dtype=torch.int32)
+    )
+    mode = args["forward_batch"].forward_mode
+    mode.is_dllm_extend = lambda: False
+    mode.is_decode_or_idle = lambda: width == 1
+    device_lengths = torch.zeros(8, dtype=torch.int32)
+    return backend, ns, mode, device_lengths
+
+
+@pytest.mark.parametrize("width", [1, 3])
+def test_c8_graph_metadata_updates_pages_without_mutating_lengths(width):
+    backend, ns, mode, device_lengths = _graph_metadata_case(width)
+    fm = backend._init_cuda_graph_metadata(8, mode, device_lengths)
+    table_ptr = fm.block_tables.data_ptr()
+    assert fm.actual_seq_lengths_q.tolist() == list(range(width, 8 * width + 1, width))
+    assert fm.metadata_flash_mla is None and fm.seqused_q is None
+    req = torch.tensor([1, 2, 0, 0, 0, 0, 0, 0])
+    # Across page boundaries, accepted/rejected verify advances, an idle step
+    # and a subsequent live step, the graph's table address must stay fixed.
+    for final_lengths in ([128, 129], [129, 257], [128, 130], [0, 0], [257, 128]):
+        cpu_lengths = torch.tensor(
+            [*final_lengths, 0, 0, 0, 0, 0, 0], dtype=torch.int32
+        )
+        device_lengths.copy_(cpu_lengths)
+        if width > 1:
+            device_lengths.sub_(torch.where(cpu_lengths > 0, width, 0))
+        before = device_lengths.clone()
+        backend._apply_cuda_graph_metadata(
+            bs=8,
+            req_pool_indices=req,
+            seq_lens=device_lengths,
+            seq_lens_cpu=cpu_lengths,
+            forward_mode=mode,
+            spec_info=SimpleNamespace() if width > 1 else None,
+        )
+        assert backend.forward_metadata is fm and backend.graph_mode
+        assert fm.block_tables.data_ptr() == table_ptr
+        torch.testing.assert_close(device_lengths, before)
+        max_len = max(final_lengths)
+        pages = (max_len + 127) // 128
+        expected = torch.zeros_like(fm.block_tables)
+        expected[:, :pages] = backend.req_to_token[req, 0:max_len:128] // 128
+        torch.testing.assert_close(fm.block_tables, expected)
+    ns["flash_mla_with_kvcache_metadata"].assert_not_called()
+
+
+def test_bf16_graph_metadata_still_uses_flashmla(monkeypatch):
+    backend, ns, mode, lengths = _graph_metadata_case(width=3)
+    backend.use_mla_fp8 = False
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            get_device_properties=lambda: SimpleNamespace(
+                cube_core_num=2, vector_core_num=2
+            )
+        ),
+        raising=False,
+    )
+    fm = backend._init_cuda_graph_metadata(8, mode, lengths)
+    assert fm.actual_seq_lengths_q.tolist() == list(range(0, 25, 3))
+    assert fm.metadata_flash_mla is not None and fm.seqused_q.shape == (8,)
+    backend._apply_cuda_graph_metadata(
+        bs=8,
+        req_pool_indices=torch.zeros(8, dtype=torch.int64),
+        seq_lens=lengths,
+        seq_lens_cpu=lengths.clone(),
+        forward_mode=mode,
+        spec_info=SimpleNamespace(),
+    )
+    ns["flash_mla_with_kvcache_metadata"].assert_called_once()
 
 
 def test_ragged_verify_does_not_reuse_static_lengths():

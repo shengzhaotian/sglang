@@ -288,3 +288,94 @@ def test_dsa_packed_cache_keeps_its_existing_storage_and_write_path(monkeypatch)
     torch.testing.assert_close(
         pool.get_kv_buffer(3).float().reshape(-1, 1, 656)[4:5], packed.float()
     )
+
+
+@pytest.mark.parametrize("nz", [False, True])
+@pytest.mark.parametrize("loc_dtype", [torch.int32, torch.int64])
+def test_fixed_bucket_live_idle_writes_preserve_cache_addresses_and_live_slots(
+    nz, loc_dtype
+):
+    """Replay the cache-write contract, without claiming NPU graph support.
+
+    Dummy rows can race when they all target slot zero. Only its isolation from
+    live slots is required; its final contents are deliberately not asserted.
+    """
+    pool = _pool(nz=nz)
+    layer = _layer()
+    bucket = 4
+    latent, rope = _inputs(bucket)
+    loc = torch.zeros(bucket, dtype=loc_dtype)
+    original_ptrs = (
+        pool.k_buffer.data_ptr(),
+        pool.v_buffer.data_ptr(),
+        latent.data_ptr(),
+        rope.data_ptr(),
+        loc.data_ptr(),
+        layer.fak_descale_float.data_ptr(),
+    )
+    expected_k = torch.zeros(20, 1, 512)
+    expected_rope = torch.zeros(20, 1, 64)
+
+    for step, locations in enumerate(
+        ([4, 5, 0, 0], [8, 9, 0, 0], [0] * 4, [5, 12, 0, 0])
+    ):
+        # Change values in-place, as the graph runner refreshes fixed buffers.
+        loc.copy_(torch.tensor(locations, dtype=loc_dtype))
+        next_latent, next_rope = _inputs(bucket)
+        latent.copy_(next_latent / (step + 1))
+        rope.copy_(next_rope + step)
+        pool.set_kv_buffer(layer, loc, latent, rope)
+
+        for row, slot in enumerate(locations):
+            if slot:
+                expected_k[slot] = _quantized(latent[row], 0.25)
+                expected_rope[slot] = rope[row].float()
+        torch.testing.assert_close(
+            _logical(pool.get_key_buffer(3), pool)[1:], expected_k[1:]
+        )
+        torch.testing.assert_close(
+            _logical(pool.get_value_buffer(3), pool)[1:], expected_rope[1:]
+        )
+        assert original_ptrs == (
+            pool.k_buffer.data_ptr(),
+            pool.v_buffer.data_ptr(),
+            latent.data_ptr(),
+            rope.data_ptr(),
+            loc.data_ptr(),
+            layer.fak_descale_float.data_ptr(),
+        )
+        assert not bool(pool.get_key_buffer(4).float().any())
+        assert not bool(pool.get_value_buffer(4).any())
+
+
+@pytest.mark.parametrize("nz", [False, True])
+def test_cache_writer_fx_graph_uses_runtime_values_with_fixed_shapes(nz):
+    """CPU FX checks tensor dependencies, not torch_npu graph compatibility."""
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    pool = _pool(nz=nz)
+    layer = _layer()
+    latent, rope = _inputs(4)
+    loc = torch.tensor([4, 5, 0, 0], dtype=torch.int32)
+
+    def write(key, side, indices):
+        pool.set_kv_buffer(layer, indices, key, side)
+        return pool.get_key_buffer(3), pool.get_value_buffer(3)
+
+    # The mock scatter lowers to native tensor operations. Trace with fixed
+    # shapes, then reuse the graph with different locations and values.
+    graph = make_fx(write)(latent, rope, loc)
+    assert not any(
+        "_local_scalar_dense" in str(node.target) or "nonzero" in str(node.target)
+        for node in graph.graph.nodes
+    )
+    original_ptrs = pool.k_buffer.data_ptr(), pool.v_buffer.data_ptr()
+    next_latent, next_rope = latent / 2, rope + 1
+    next_loc = torch.tensor([8, 9, 0, 0], dtype=torch.int32)
+    key, side = graph(next_latent, next_rope, next_loc)
+    torch.testing.assert_close(
+        _logical(key, pool)[8:10], _quantized(next_latent[:2], 0.25)
+    )
+    torch.testing.assert_close(_logical(side, pool)[8:10], next_rope[:2].float())
+    torch.testing.assert_close(_logical(key, pool)[4:6], _quantized(latent[:2], 0.25))
+    assert original_ptrs == (pool.k_buffer.data_ptr(), pool.v_buffer.data_ptr())

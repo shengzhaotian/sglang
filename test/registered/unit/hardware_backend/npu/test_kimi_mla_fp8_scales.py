@@ -179,7 +179,7 @@ class TestKimiMLAFP8Scales(unittest.TestCase):
 
     def test_missing_scale_does_not_fall_back_to_one(self):
         layer = self.layer()
-        layer.fa_k.scale.weight_loader(layer.fa_k.scale, torch.tensor([0.25]))
+        layer.fa_v.scale.weight_loader(layer.fa_v.scale, torch.tensor([0.25]))
         with self.assertRaisesRegex(RuntimeError, "unit-scale fallback"):
             self.refresh(layer)
         self.assertFalse(layer._modelslim_fp8_kv_scale_ready)
@@ -191,23 +191,42 @@ class TestKimiMLAFP8Scales(unittest.TestCase):
                 self.load(layer)
                 self.refresh(layer)
                 layer.fa_k.scale.data.fill_(value)
-                layer.fa_v.scale.data.fill_(value)
                 with self.assertRaises((ValueError, RuntimeError)):
                     self.refresh(layer)
                 self.assertFalse(layer._modelslim_fp8_kv_scale_ready)
 
-    def test_distinct_k_v_scale_is_rejected(self):
+    def test_checkpoint_distinct_k_v_scales_use_k_for_shared_latent(self):
         layer = self.layer()
-        self.load(layer)
-        layer.fa_v.scale.data.fill_(0.5)
-        with self.assertRaisesRegex(ValueError, "must be identical"):
-            self.refresh(layer)
+        k_scale = torch.tensor([[0.00885009765625]], dtype=torch.float32)
+        v_scale = torch.tensor([[0.01129150390625]], dtype=torch.float32)
+        for role, scale in (("k", k_scale), ("v", v_scale)):
+            module = getattr(layer, f"fa_{role}")
+            module.scale.weight_loader(module.scale, scale)
+            module.offset.weight_loader(module.offset, torch.zeros_like(scale))
+        self.refresh(layer)
+        self.assertTrue(layer._modelslim_fp8_kv_scale_ready)
+        torch.testing.assert_close(layer.fak_descale_float, k_scale, rtol=0, atol=0)
+        torch.testing.assert_close(
+            layer.fak_descale_reciprocal, k_scale.reciprocal(), rtol=0, atol=0
+        )
+        torch.testing.assert_close(layer.fa_k.scale, k_scale, rtol=0, atol=0)
+        torch.testing.assert_close(layer.fa_v.scale, v_scale, rtol=0, atol=0)
+
+    def test_unused_v_parameters_do_not_control_runtime_scale(self):
+        layer = self.layer()
+        layer.fa_k.scale.weight_loader(layer.fa_k.scale, torch.tensor([[0.25]]))
+        # V is registered for the checkpoint loader but absent from this runtime
+        # contract: its initial NaN scale must not replace or invalidate K.
+        self.refresh(layer)
+        self.assertTrue(layer._modelslim_fp8_kv_scale_ready)
+        torch.testing.assert_close(layer.fak_descale_float, torch.tensor([[0.25]]))
+        torch.testing.assert_close(layer.fak_descale_reciprocal, torch.tensor([[4.0]]))
 
     def test_nonzero_or_nonfinite_offset_is_rejected(self):
         for value in (1.0, float("nan"), float("inf")):
             layer = self.layer()
             self.load(layer)
-            layer.fa_v.offset.data.fill_(value)
+            layer.fa_k.offset.data.fill_(value)
             with self.assertRaisesRegex(ValueError, "finite and zero"):
                 self.refresh(layer)
 

@@ -862,7 +862,7 @@ class AscendAttnBackend(AttentionBackend):
         #         device=seq_lens.device,
         #     )
         device = seq_lens.device
-        if self.use_mla:
+        if self.use_mla and not self.use_mla_fp8:
             def _calculate_metadata_size(batch_size, aic_core_num, aiv_core_num):
                 """计算 metadata tensor 的对齐后大小。
 
@@ -990,6 +990,14 @@ class AscendAttnBackend(AttentionBackend):
             if total_pages < metadata.block_tables.shape[1]:
                 metadata.block_tables[:bs, total_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
+
+        if self.use_mla_fp8:
+            # FIA v2 reads the stable page table above; NPUGraph.update replaces
+            # its host KV lengths on replay. It does not consume FlashMLA's
+            # BF16 metadata or the device-side speculative length adjustment.
+            self.forward_metadata = metadata
+            self.graph_mode = True
+            return
 
         if self.use_mla:
             query_seq_len = (
@@ -3003,11 +3011,10 @@ class AscendAttnBackend(AttentionBackend):
         *,
         is_verify,
     ):
-        # The eager C8 contract matches the upstream FIA v2 decode/MTP path.
-        # The existing graph/A2A metadata is specific to the BF16 FlashMLA path.
-        if self.graph_mode or self.use_sparse_attn_a2a or self.attn_cp_size > 1:
+        # Same FIA v2 C8 contract for eager and graph decode/static verify.
+        if self.use_sparse_attn_a2a or self.attn_cp_size > 1:
             raise NotImplementedError(
-                "MLA C8 currently requires eager, non-CP/non-A2A execution"
+                "MLA C8 currently requires non-CP/non-A2A execution"
             )
         if dequant_scale_q_nope is None or fp8_kv_scale is None:
             raise ValueError(
@@ -3017,7 +3024,13 @@ class AscendAttnBackend(AttentionBackend):
             raise ValueError("MLA C8 expects FP8 E4M3 Q and BF16 side features")
 
         padded_tokens = q.shape[0]
-        num_tokens = forward_batch.num_token_non_padded_cpu
+        # Capture the full bucket. Replay updates the KV lengths (zero for
+        # padded requests), not this Python slicing decision or tensor shapes.
+        num_tokens = (
+            padded_tokens
+            if self.graph_mode
+            else forward_batch.num_token_non_padded_cpu
+        )
         if num_tokens is None:
             num_tokens = padded_tokens
         output = torch.zeros(

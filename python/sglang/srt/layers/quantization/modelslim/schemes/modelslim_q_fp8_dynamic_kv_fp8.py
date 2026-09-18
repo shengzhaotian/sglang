@@ -71,24 +71,22 @@ class ModelSlimQFP8DynamicKVFP8Scheme(ModelSlimKVSchemeBase):
     def process_weights_after_loading(self, layer: nn.Module):
         # Invalidate a previous successful load before checking replacement data.
         layer._modelslim_fp8_kv_scale_ready = False
-        for name in ("fa_k", "fa_v"):
-            scale = getattr(layer, name).scale
-            if not torch.isfinite(scale).all():
-                raise RuntimeError(
-                    f"Missing or non-finite ModelSlim {name}.scale for {self.prefix}; "
-                    "Q_FP8_DYNAMIC_KV_FP8 does not permit a unit-scale fallback."
-                )
-            if (scale <= 0).any():
-                raise ValueError(f"ModelSlim {name}.scale must be positive")
-            offset = getattr(layer, name).offset
-            if not torch.isfinite(offset).all() or torch.count_nonzero(offset).item():
-                raise ValueError(f"ModelSlim {name}.offset must be finite and zero")
-
-        if not torch.equal(layer.fa_k.scale, layer.fa_v.scale):
-            raise ValueError(
-                "ModelSlim K/V scales must be identical for the shared-latent MLA cache"
+        # The absorbed MLA cache quantizes the shared latent with fa_k only.
+        # fa_v is loaded for checkpoint compatibility, not used to quantize or
+        # descale the latent a second time (matching the ModelSlim Kimi adapter).
+        scale = layer.fa_k.scale
+        if not torch.isfinite(scale).all():
+            raise RuntimeError(
+                f"Missing or non-finite ModelSlim fa_k.scale for {self.prefix}; "
+                "Q_FP8_DYNAMIC_KV_FP8 does not permit a unit-scale fallback."
             )
-        scale = layer.fa_k.scale.reshape(1, -1)
+        if (scale <= 0).any():
+            raise ValueError("ModelSlim fa_k.scale must be positive")
+        offset = layer.fa_k.offset
+        if not torch.isfinite(offset).all() or torch.count_nonzero(offset).item():
+            raise ValueError("ModelSlim fa_k.offset must be finite and zero")
+
+        scale = scale.reshape(1, -1)
         reciprocal = scale.reciprocal()
         if not torch.isfinite(reciprocal).all():
             raise ValueError("ModelSlim KV reciprocal scale must be finite in FP32")
