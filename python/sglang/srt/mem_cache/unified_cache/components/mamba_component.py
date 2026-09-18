@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -56,6 +57,57 @@ if TYPE_CHECKING:
     )
 
 
+def compute_mamba_state_decay_evictions(
+    holder_depths: Sequence[int],
+    tail_depth: int,
+    decay_base: int,
+    decay_floor: int,
+) -> set[int]:
+    """Age-based geometric thinning: which of a root-to-tail path's Mamba
+    state depths (in tokens) the decay rule evicts.
+
+    Pure and tree-independent (no node objects, no protections) so it is
+    unit-testable in isolation; the caller maps the depths this returns back
+    to nodes and still applies the usual eviction protections (tail, fork,
+    locked, device-leaf) before actually evicting.
+
+    A depth survives iff its age (`tail_depth - depth`) is younger than
+    `decay_base`, or it is the deepest holder in its `decay_base`-wide slot
+    and that slot index is a multiple of the age band's step (a power of two,
+    capped by `decay_floor // decay_base` once `decay_floor` is set).
+
+    Survival is decided by alignment to this fixed slot grid, not by distance
+    to the previously kept survivor: a relative "far enough from the last
+    keeper" rule is unstable under incremental re-application here, since
+    every new tail arrival would delete yesterday's future survivors before
+    they age into being useful, collapsing a path down to just its two
+    newest states instead of thinning geometrically.
+    """
+    if decay_base <= 0:
+        return set()
+
+    max_band_step = decay_floor // decay_base if decay_floor > 0 else None
+    aged = [depth for depth in holder_depths if tail_depth - depth >= decay_base]
+
+    deepest_in_slot: dict[int, int] = {}
+    for depth in aged:
+        slot = depth // decay_base
+        if slot not in deepest_in_slot or depth > deepest_in_slot[slot]:
+            deepest_in_slot[slot] = depth
+
+    survivors = set()
+    for slot, depth in deepest_in_slot.items():
+        age = tail_depth - depth
+        band = (age // decay_base).bit_length() - 1
+        step = 1 << band
+        if max_band_step is not None:
+            step = min(step, max_band_step)
+        if slot % step == 0:
+            survivors.add(depth)
+
+    return {depth for depth in aged if depth not in survivors}
+
+
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
 
@@ -75,6 +127,8 @@ class MambaComponent(TreeComponent):
         # widened by dcp_size, so it is the one grid a checkpoint depth can land on.
         self.mamba_checkpoint_grid = mamba_checkpoint_grid(params.page_size)
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
+        self.mamba_state_decay_base = get_exec().mamba.mamba_state_decay_base
+        self.mamba_state_decay_floor = get_exec().mamba.mamba_state_decay_floor
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
@@ -254,8 +308,9 @@ class MambaComponent(TreeComponent):
         tail: UnifiedTreeNode,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
-        """Defer the path-cap eviction so it runs after the insert's BackupKV."""
-        if self.mamba_max_states_per_path < 0:
+        """Defer the path-cap/decay eviction so it runs after the insert's BackupKV."""
+        decay_base = getattr(self, "mamba_state_decay_base", 0)
+        if self.mamba_max_states_per_path < 0 and decay_base <= 0:
             return
         cache_actions.append(MambaEvictExcessPathStates(tail.id))
 
@@ -265,36 +320,85 @@ class MambaComponent(TreeComponent):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
-        """Evict shallow eligible device checkpoints beyond the path cap.
+        """Thin, then cap, the device checkpoints on the tail's root path.
 
-        Full KV and any existing host backup are retained. The tail, forks,
-        locked nodes (including a pending backup chain's write-through locks),
-        and device leaves are preserved, so the cap is a best-effort soft
-        limit. Freed slots are collected into the caller's dicts.
+        Two independent passes, in order: first the age-based geometric decay
+        (--mamba-state-decay-base/-floor), then the existing hard cap
+        (--mamba-max-states-per-path) on whatever the decay pass left behind.
+        Full KV and any existing host backup are retained throughout. The
+        tail, forks, locked nodes (including a pending backup chain's
+        write-through locks), and device leaves are preserved in both passes,
+        so each is only a best-effort soft limit. Freed slots are collected
+        into the caller's dicts.
         """
         cap = self.mamba_max_states_per_path
-        if cap < 0:
+        decay_base = getattr(self, "mamba_state_decay_base", 0)
+        decay_floor = getattr(self, "mamba_state_decay_floor", 0)
+        if cap < 0 and decay_base <= 0:
             return
 
         ct = self.component_type
-        holders = []
+        chain = []
         node = tail
         while node is not None and node is not self.tree_core.root_node:
-            if node.component_data[ct].value is not None:
-                holders.append(node)
+            chain.append(node)
             node = node.parent
-
-        excess = len(holders) - cap
-        if excess <= 0:
+        if not chain:
             return
 
+        # Shallow -> deep (root-ward first), like the old `reversed(holders)`.
+        holders = [n for n in reversed(chain) if n.component_data[ct].value is not None]
+
         tracker = {component: 0 for component in self.cache.tree_components}
-        for node in reversed(holders):
-            if excess <= 0 or node is tail:
+
+        def _protected(node: UnifiedTreeNode) -> bool:
+            cd = node.component_data[ct]
+            return (
+                node is tail
+                or cd.lock_ref > 0
+                or len(node.children) != 1
+                or node in self.tree_core.evictable_device_leaves
+            )
+
+        survivors = holders
+        if decay_base > 0 and holders:
+            # `len(node.key)` (token count of this node's own edge) is only
+            # walked when decay is enabled; the cap-only path never needs a
+            # holder's absolute depth.
+            depths: dict[int, int] = {}
+            depth = 0
+            for n in reversed(chain):
+                depth += len(n.key)
+                depths[n.id] = depth
+            tail_depth = depth
+            evict_depths = compute_mamba_state_decay_evictions(
+                [depths[n.id] for n in holders], tail_depth, decay_base, decay_floor
+            )
+            if evict_depths:
+                survivors = []
+                for node in holders:
+                    if depths[node.id] in evict_depths and not _protected(node):
+                        self.tree_core._evict_component_and_detach_lru(
+                            node,
+                            self,
+                            device_frees,
+                            host_frees,
+                            target=EvictLayer.DEVICE,
+                            tracker=tracker,
+                        )
+                        self.tree_core._cascade_evict(
+                            node, self, tracker, device_frees, host_frees
+                        )
+                    else:
+                        survivors.append(node)
+
+        if cap < 0:
+            return
+        excess = len(survivors) - cap
+        for node in survivors:
+            if excess <= 0:
                 break
-            if node.component_data[ct].lock_ref > 0 or len(node.children) != 1:
-                continue
-            if node in self.tree_core.evictable_device_leaves:
+            if _protected(node):
                 continue
             self.tree_core._evict_component_and_detach_lru(
                 node,

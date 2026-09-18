@@ -2024,6 +2024,18 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mamba-state-decay-base`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Age-based geometric thinning of cached Mamba states, applied per root-to-tail path at the same point as <code>--mamba-max-states-per-path</code> (before it): the width, in tokens, of the newest age band that is always kept in full; older states are kept only when their depth aligns to that band&apos;s slot grid, so a fork of age <code>age</code> replays at most about <code>age</code> tokens instead of from scratch. <code>0</code> disables. Must be <code>0</code> or a positive multiple of the mamba checkpoint grid (<code>lcm(mamba_cache_chunk_size, page_size)</code>).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mamba-state-decay-floor`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Floor, in tokens, on the band spacing <code>--mamba-state-decay-base</code> doubles into with age: beyond this age, surviving states stay at most this many tokens apart instead of the spacing continuing to double. <code>0</code> means no floor (spacing keeps doubling). Must be <code>0</code> or <code>--mamba-state-decay-base</code> times a power of two.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
       <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-int8-mamba-checkpoint`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.</td>

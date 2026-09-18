@@ -190,6 +190,48 @@ def validate_mamba_extra_buffer(view, model_arch: str, *, mamba_cache_chunk_size
             mamba_prefill_checkpoint_positions=positions,
         )
 
+    # Same `getattr` defaults as above, for the same reason.
+    decay_base = getattr(view, "mamba_state_decay_base", 0)
+    decay_floor = getattr(view, "mamba_state_decay_floor", 0)
+    if decay_base or decay_floor:
+        assert (
+            decay_base >= 0
+        ), f"--mamba-state-decay-base={decay_base} must be non-negative."
+        assert (
+            decay_floor >= 0
+        ), f"--mamba-state-decay-floor={decay_floor} must be non-negative."
+        if decay_floor > 0:
+            assert decay_base > 0, (
+                "--mamba-state-decay-floor requires --mamba-state-decay-base to "
+                "also be set (it floors the band spacing --mamba-state-decay-base "
+                "doubles into)."
+            )
+        if decay_base > 0:
+            if view.page_size is None:
+                # Same deferral as --mamba-prefill-checkpoint-at/-interval above:
+                # the grid derives from `page_size`, not resolved at this hook's
+                # call sites yet. The runtime path recomputes it once resolved.
+                logger.warning(
+                    "--mamba-state-decay-base=%d could not be validated against "
+                    "the mamba checkpoint grid because --page-size is not "
+                    "resolved yet.",
+                    decay_base,
+                )
+            else:
+                grid = math.lcm(mamba_cache_chunk_size_of(), view.page_size)
+                assert decay_base % grid == 0, (
+                    f"--mamba-state-decay-base={decay_base} must be a positive "
+                    f"multiple of the mamba checkpoint grid {grid} "
+                    "(lcm(mamba_cache_chunk_size, page_size))."
+                )
+            if decay_floor > 0:
+                ratio, remainder = divmod(decay_floor, decay_base)
+                assert remainder == 0 and ratio > 0 and (ratio & (ratio - 1)) == 0, (
+                    f"--mamba-state-decay-floor={decay_floor} must equal "
+                    f"--mamba-state-decay-base={decay_base} times a power of two, "
+                    f"got a ratio of {decay_floor / decay_base}."
+                )
+
 
 def validate_mamba_no_buffer(view, model_arch: str):
     assert view.page_size in (1, None), "no_buffer only supports page_size=1."
@@ -206,4 +248,14 @@ def validate_mamba_no_buffer(view, model_arch: str):
             "--mamba-radix-cache-strategy no_buffer: no_buffer has no "
             "state-tracking path to pin a prefix checkpoint on.",
             raw_checkpoint_at,
+        )
+    decay_base = getattr(view, "mamba_state_decay_base", 0)
+    decay_floor = getattr(view, "mamba_state_decay_floor", 0)
+    if decay_base or decay_floor:
+        logger.warning(
+            "--mamba-state-decay-base=%d --mamba-state-decay-floor=%d are "
+            "ignored under --mamba-radix-cache-strategy no_buffer: no_buffer "
+            "has no state-tracking path to thin.",
+            decay_base,
+            decay_floor,
         )

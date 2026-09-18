@@ -2596,6 +2596,27 @@ class ServerArgs:
         "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer.",
         NS("exec.mamba"),
     ] = -1
+    mamba_state_decay_base: A[
+        int,
+        "Age-based geometric thinning of cached Mamba states, applied per "
+        "root-to-tail path at the same point as --mamba-max-states-per-path "
+        "(before it): the width, in tokens, of the newest age band that is "
+        "always kept in full; older states are kept only when their depth "
+        "aligns to that band's slot grid, so a fork of age `age` replays at "
+        "most about `age` tokens instead of from scratch. 0 disables. Must be "
+        "0 or a positive multiple of the mamba checkpoint grid "
+        "(lcm(mamba_cache_chunk_size, page_size)).",
+        NS("exec.mamba"),
+    ] = 0
+    mamba_state_decay_floor: A[
+        int,
+        "Floor, in tokens, on the band spacing --mamba-state-decay-base "
+        "doubles into with age: beyond this age, surviving states stay at "
+        "most this many tokens apart instead of the spacing continuing to "
+        "double. 0 means no floor (spacing keeps doubling). Must be 0 or "
+        "--mamba-state-decay-base times a power of two.",
+        NS("exec.mamba"),
+    ] = 0
     enable_mamba_cache_stochastic_rounding: A[
         bool,
         "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",
