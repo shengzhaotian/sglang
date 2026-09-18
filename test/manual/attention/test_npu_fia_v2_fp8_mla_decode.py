@@ -30,6 +30,10 @@ Run on an Atlas A5 environment with a torch_npu build exposing FIA v2:
 
 Use ``--seq-len 4096`` for a quick smoke test. The default case is intentionally
 large and allocates roughly 180 MiB for the two physical cache tensors alone.
+
+Use ``--packed-repo-check report`` to additionally probe whether the installed
+FIA v2 can consume MLAProlog V3's combined 656-byte KV/RoPE/scale repository.
+The probe reports both the direct packed-cache ABI and zero-copy typed views.
 """
 
 from __future__ import annotations
@@ -44,6 +48,9 @@ import torch
 
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = 448.0
+MLA_KV_TILE_SIZE = 128
+FP32_BYTES = 4
+BF16_BYTES = 2
 
 
 @dataclass(frozen=True)
@@ -105,6 +112,16 @@ class CaseInputs:
     dequant_scale_kv: torch.Tensor
     attention_mask: torch.Tensor | None
     actual_seq_kvlen: list[int]
+
+
+@dataclass
+class PackedRepoViews:
+    """Typed views over MLAProlog's combined KV-cache repository."""
+
+    packed_cache: torch.Tensor
+    latent: torch.Tensor
+    key_rope: torch.Tensor
+    tile_scale: torch.Tensor
 
 
 def _fill_fp8_cache(
@@ -283,6 +300,223 @@ def _gather_pa_pages(cache: torch.Tensor, page_ids: torch.Tensor) -> torch.Tenso
         return gathered.view(FP8_DTYPE).reshape(batch, pages, *cache.shape[1:])
     gathered = torch.index_select(cache, 0, flat_ids)
     return gathered.reshape(batch, pages, *cache.shape[1:])
+
+
+def build_mlaprolog_packed_repo(
+    inputs: CaseInputs, config: CaseConfig
+) -> PackedRepoViews:
+    """Build the exact MLAProlog V3 per-token-per-group cache layout.
+
+    ``kv_cache_quant_mode=3``, ``ckvkr_repo_mode=1`` and
+    ``quant_scale_repo_mode=1`` store one byte-addressed entry as::
+
+        [FP8 latent (512 B), BF16 RoPE (128 B), FP32 scales (16 B)]
+
+    This helper uses the already validated standalone FIA inputs as payload.
+    It intentionally keeps the resulting latent/RoPE/scale tensors as aliased
+    (non-contiguous) views, because making them contiguous would no longer test
+    whether FIA can consume MLAProlog's cache repository without a conversion.
+    """
+    if config.latent_dim % MLA_KV_TILE_SIZE != 0:
+        raise ValueError("latent_dim must be divisible by MLA_KV_TILE_SIZE")
+
+    tile_count = config.latent_dim // MLA_KV_TILE_SIZE
+    packed_dim = (
+        config.latent_dim
+        + config.rope_dim * BF16_BYTES
+        + tile_count * FP32_BYTES
+    )
+    expected_packed_dim = 656
+    if packed_dim != expected_packed_dim:
+        raise ValueError(
+            f"K3 MLA packed Dtile must be {expected_packed_dim}, got {packed_dim}"
+        )
+
+    pages, block_size = inputs.latent_cache.shape[:2]
+    packed_bytes = torch.empty(
+        (pages, block_size, packed_dim),
+        dtype=torch.uint8,
+        device=inputs.latent_cache.device,
+    )
+    latent_end = config.latent_dim
+    rope_end = latent_end + config.rope_dim * BF16_BYTES
+
+    packed_bytes[..., :latent_end].copy_(inputs.latent_cache.view(torch.uint8))
+    packed_bytes[..., latent_end:rope_end].copy_(
+        inputs.key_rope_cache.view(torch.uint8)
+    )
+    tile_scale_source = (
+        inputs.dequant_scale_kv.reshape(1, 1, 1)
+        .expand(pages, block_size, tile_count)
+        .contiguous()
+    )
+    packed_bytes[..., rope_end:].copy_(tile_scale_source.view(torch.uint8))
+
+    packed_cache = packed_bytes.view(FP8_DTYPE)
+    latent = packed_cache[..., :latent_end]
+    key_rope = packed_bytes[..., latent_end:rope_end].view(torch.bfloat16)
+    tile_scale = packed_bytes[..., rope_end:].view(torch.float32)
+
+    # These checks validate both the byte offsets and dtype reinterpretation.
+    # Compare FP8 through uint8 because aclnnIndex/equality support for FP8 is
+    # incomplete on some torch_npu versions.
+    if not torch.equal(
+        latent.view(torch.uint8), inputs.latent_cache.view(torch.uint8)
+    ):
+        raise AssertionError("packed latent bytes differ from the source cache")
+    if not torch.equal(key_rope, inputs.key_rope_cache):
+        raise AssertionError("packed RoPE bytes differ from the source cache")
+    if not torch.equal(tile_scale, tile_scale_source):
+        raise AssertionError("packed tile-scale bytes differ from the source scales")
+
+    return PackedRepoViews(
+        packed_cache=packed_cache,
+        latent=latent,
+        key_rope=key_rope,
+        tile_scale=tile_scale,
+    )
+
+
+@torch.no_grad()
+def run_fia_v2_direct_packed_repo(
+    inputs: CaseInputs, config: CaseConfig, repo: PackedRepoViews
+) -> torch.Tensor:
+    """Probe whether FIA implicitly understands MLAProlog's 656-byte ABI.
+
+    No external K/V scale or key_rope is passed: both are embedded in
+    ``repo.packed_cache``. A successful call therefore means FIA recognizes
+    the same repository contract as MLAProlog. A D mismatch, missing-RoPE or
+    missing-scale error is evidence that this FIA ABI does not.
+    """
+    import torch_npu
+
+    query, _, dequant_scale_query = _pad_query_heads(inputs, config)
+    output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+        query,
+        repo.packed_cache,
+        repo.packed_cache,
+        actual_seq_kvlen=inputs.actual_seq_kvlen,
+        block_table=inputs.block_table,
+        dequant_scale_query=dequant_scale_query,
+        num_query_heads=config.padded_query_heads,
+        num_key_value_heads=config.kv_heads,
+        softmax_scale=1.0 / math.sqrt(config.latent_dim),
+        input_layout="BSND",
+        sparse_mode=3 if config.query_seq_len > 1 else 0,
+        block_size=config.block_size,
+        query_quant_mode=3,
+        key_quant_mode=0,
+        value_quant_mode=0,
+        query_dtype=FP8_DTYPE,
+        key_dtype=FP8_DTYPE,
+        value_dtype=FP8_DTYPE,
+        dequant_scale_query_dtype=torch.float32,
+        out_dtype=torch.bfloat16,
+    )
+    return output[:, :, : config.local_query_heads, :].contiguous()
+
+
+@torch.no_grad()
+def run_fia_v2_packed_alias_views(
+    inputs: CaseInputs, config: CaseConfig, repo: PackedRepoViews
+) -> torch.Tensor:
+    """Probe FIA using zero-copy typed views of the same packed repository.
+
+    This is the fallback integration shape if FIA cannot consume Dtile=656
+    directly. The four FP32 scales per token are deliberately passed without
+    collapsing them to a scalar: accepting this call would prove FIA supports
+    MLAProlog's per-token/per-128-group scale contract. Rejecting its shape or
+    dtype proves that a conversion or a different attention ABI is required.
+    """
+    import torch_npu
+
+    query, query_rope, dequant_scale_query = _pad_query_heads(inputs, config)
+    output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+        query,
+        repo.latent,
+        repo.latent,
+        query_rope=query_rope,
+        key_rope=repo.key_rope,
+        atten_mask=inputs.attention_mask,
+        actual_seq_kvlen=inputs.actual_seq_kvlen,
+        block_table=inputs.block_table,
+        dequant_scale_query=dequant_scale_query,
+        dequant_scale_key=repo.tile_scale,
+        dequant_scale_value=repo.tile_scale,
+        num_query_heads=config.padded_query_heads,
+        num_key_value_heads=config.kv_heads,
+        softmax_scale=1.0 / math.sqrt(config.latent_dim),
+        input_layout="BSND",
+        sparse_mode=3 if config.query_seq_len > 1 else 0,
+        block_size=config.block_size,
+        query_quant_mode=3,
+        key_quant_mode=6,
+        value_quant_mode=6,
+        query_dtype=FP8_DTYPE,
+        key_dtype=FP8_DTYPE,
+        value_dtype=FP8_DTYPE,
+        query_rope_dtype=torch.bfloat16,
+        key_rope_dtype=torch.bfloat16,
+        dequant_scale_query_dtype=torch.float32,
+        dequant_scale_key_dtype=torch.float32,
+        dequant_scale_value_dtype=torch.float32,
+        out_dtype=torch.bfloat16,
+    )
+    return output[:, :, : config.local_query_heads, :].contiguous()
+
+
+def _format_probe_error(exc: RuntimeError) -> str:
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    return " | ".join(lines[:4])
+
+
+def probe_fia_packed_repo(
+    inputs: CaseInputs, config: CaseConfig, expectation: str
+) -> None:
+    """Run both possible FIA consumers and enforce the requested expectation."""
+    repo = build_mlaprolog_packed_repo(inputs, config)
+    print(
+        "packed repo: "
+        f"shape={tuple(repo.packed_cache.shape)}, dtype={repo.packed_cache.dtype}, "
+        f"latent_stride={repo.latent.stride()}, "
+        f"rope_stride={repo.key_rope.stride()}, "
+        f"scale_shape={tuple(repo.tile_scale.shape)}"
+    )
+
+    results: dict[str, tuple[bool, torch.Tensor | RuntimeError]] = {}
+    probes = {
+        "direct Dtile=656": run_fia_v2_direct_packed_repo,
+        "zero-copy alias views": run_fia_v2_packed_alias_views,
+    }
+    for name, probe in probes.items():
+        try:
+            output = probe(inputs, config, repo)
+            torch.npu.synchronize()
+            results[name] = (True, output)
+            print(
+                f"packed FIA probe [{name}]: SUPPORTED, "
+                f"output={tuple(output.shape)} {output.dtype}"
+            )
+        except RuntimeError as exc:
+            results[name] = (False, exc)
+            print(
+                f"packed FIA probe [{name}]: REJECTED, "
+                f"reason={_format_probe_error(exc)}"
+            )
+
+    any_supported = any(supported for supported, _ in results.values())
+    if expectation == "supported" and not any_supported:
+        raise AssertionError(
+            "FIA rejected both MLAProlog packed-cache consumption strategies"
+        )
+    if expectation == "unsupported" and any_supported:
+        supported_names = [
+            name for name, (supported, _) in results.items() if supported
+        ]
+        raise AssertionError(
+            "FIA unexpectedly accepted MLAProlog packed cache through: "
+            + ", ".join(supported_names)
+        )
 
 
 @torch.no_grad()
@@ -531,6 +765,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--reference-chunk-tokens", type=int, default=8192)
+    parser.add_argument(
+        "--packed-repo-check",
+        choices=("off", "report", "supported", "unsupported"),
+        default="off",
+        help=(
+            "probe FIA consumption of MLAProlog's 656-byte combined KV/rope/scale "
+            "repository; report records the result without changing pass/fail, while "
+            "supported/unsupported assert the expected CANN capability"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -576,6 +820,13 @@ def run_case(args: argparse.Namespace, query_seq_len: int) -> None:
         stepwise = run_fia_v2_stepwise(inputs, config)
         print("causal check: batched Sq=N versus N independent Sq=1 calls")
         compare_outputs(actual, stepwise)
+    if args.packed_repo_check != "off":
+        print(
+            "packed repository check: MLAProlog V3 ABI "
+            "(kv_cache_quant_mode=3, ckvkr_repo_mode=1, "
+            "quant_scale_repo_mode=1)"
+        )
+        probe_fia_packed_repo(inputs, config, args.packed_repo_check)
     print("PASS")
 
 
