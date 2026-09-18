@@ -383,18 +383,22 @@ def run_fia_v2_direct_packed_repo(
 ) -> torch.Tensor:
     """Probe whether FIA implicitly understands MLAProlog's 656-byte ABI.
 
-    No external K/V scale or key_rope is passed: both are embedded in
-    ``repo.packed_cache``. A successful call therefore means FIA recognizes
-    the same repository contract as MLAProlog. A D mismatch, missing-RoPE or
-    missing-scale error is evidence that this FIA ABI does not.
+    No external K/V scale is passed because it is embedded in
+    ``repo.packed_cache``. FIA still needs explicit RoPE tensors to select its
+    Decode-MLA tiling path, so ``key_rope`` is an alias of the same packed
+    storage rather than a copied cache. A D mismatch or missing-scale error is
+    evidence that FIA does not recognize MLAProlog's combined scale contract.
     """
     import torch_npu
 
-    query, _, dequant_scale_query = _pad_query_heads(inputs, config)
+    query, query_rope, dequant_scale_query = _pad_query_heads(inputs, config)
     output, _ = torch_npu.npu_fused_infer_attention_score_v2(
         query,
         repo.packed_cache,
         repo.packed_cache,
+        query_rope=query_rope,
+        key_rope=repo.key_rope,
+        atten_mask=inputs.attention_mask,
         actual_seq_kvlen=inputs.actual_seq_kvlen,
         block_table=inputs.block_table,
         dequant_scale_query=dequant_scale_query,
@@ -410,6 +414,8 @@ def run_fia_v2_direct_packed_repo(
         query_dtype=FP8_DTYPE,
         key_dtype=FP8_DTYPE,
         value_dtype=FP8_DTYPE,
+        query_rope_dtype=torch.bfloat16,
+        key_rope_dtype=torch.bfloat16,
         dequant_scale_query_dtype=torch.float32,
         out_dtype=torch.bfloat16,
     )
@@ -423,10 +429,11 @@ def run_fia_v2_packed_alias_views(
     """Probe FIA using zero-copy typed views of the same packed repository.
 
     This is the fallback integration shape if FIA cannot consume Dtile=656
-    directly. The four FP32 scales per token are deliberately passed without
-    collapsing them to a scalar: accepting this call would prove FIA supports
-    MLAProlog's per-token/per-128-group scale contract. Rejecting its shape or
-    dtype proves that a conversion or a different attention ABI is required.
+    directly. It uses FIA Decode MLA's documented 3/0/0 quant-mode tuple, but
+    deliberately supplies the four FP32 scales per token without collapsing
+    them to a scalar. Accepting this call would prove FIA can extend mode 0 to
+    MLAProlog's per-token/per-128-group repository. Rejecting its scale shape or
+    stride proves that a conversion or a different attention ABI is required.
     """
     import torch_npu
 
@@ -450,8 +457,8 @@ def run_fia_v2_packed_alias_views(
         sparse_mode=3 if config.query_seq_len > 1 else 0,
         block_size=config.block_size,
         query_quant_mode=3,
-        key_quant_mode=6,
-        value_quant_mode=6,
+        key_quant_mode=0,
+        value_quant_mode=0,
         query_dtype=FP8_DTYPE,
         key_dtype=FP8_DTYPE,
         value_dtype=FP8_DTYPE,
