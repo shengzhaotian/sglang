@@ -111,7 +111,14 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self.model_runner = model_runner
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
-        self.if_use_v2 = any(
+        # Resolve against this runner, not the target's process-global dtype:
+        # a DSpark draft may explicitly retain a BF16 cache.
+        self.use_mla_fp8 = (
+            model_runner.model_config.attention_arch == AttentionArch.MLA
+            and model_runner.kv_cache_dtype_str == "fp8_e4m3"
+            and not is_deepseek_dsa(model_runner.model_config.hf_config)
+        )
+        self.if_use_v2 = self.use_mla_fp8 or any(
             arch
             in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
             for arch in (model_runner.model_config.hf_config.architectures or [])
@@ -251,7 +258,15 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
-            if forward_batch.forward_mode.is_target_verify():
+            if (
+                self.use_mla_fp8
+                and self.capture_forward_mode.is_target_verify()
+                and forward_batch.forward_mode.is_idle()
+            ):
+                # An IDLE rank still replays its captured verify bucket. All
+                # requests are padding, even if CPU/device inputs were reused.
+                seq_lens = [0] * self.bs
+            elif forward_batch.forward_mode.is_target_verify():
                 if self.model_runner.spec_algorithm.is_dspark():
                     # DSpark publishes the final verify KV boundary on CPU.
                     # Do not add the speculative width a second time.

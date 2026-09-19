@@ -334,6 +334,11 @@ class AscendAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.model_dtype = model_runner.model_config.dtype
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self.use_mla_fp8 = (
+            self.use_mla
+            and model_runner.kv_cache_dtype_str == "fp8_e4m3"
+            and not is_deepseek_dsa(model_runner.model_config.hf_text_config)
+        )
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -857,7 +862,7 @@ class AscendAttnBackend(AttentionBackend):
         #         device=seq_lens.device,
         #     )
         device = seq_lens.device
-        if self.use_mla:
+        if self.use_mla and not self.use_mla_fp8:
             def _calculate_metadata_size(batch_size, aic_core_num, aiv_core_num):
                 """计算 metadata tensor 的对齐后大小。
 
@@ -985,6 +990,14 @@ class AscendAttnBackend(AttentionBackend):
             if total_pages < metadata.block_tables.shape[1]:
                 metadata.block_tables[:bs, total_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
+
+        if self.use_mla_fp8:
+            # FIA v2 reads the stable page table above; NPUGraph.update replaces
+            # its host KV lengths on replay. It does not consume FlashMLA's
+            # BF16 metadata or the device-side speculative length adjustment.
+            self.forward_metadata = metadata
+            self.graph_mode = True
+            return
 
         if self.use_mla:
             query_seq_len = (
@@ -2297,6 +2310,8 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
+        dequant_scale_q_nope: Optional[torch.Tensor] = None,
+        fp8_kv_scale: Optional[torch.Tensor] = None,
     ):
         if is_mla_preprocess_enabled() and self.use_mla:
             # MLAPO and MLAPROLOG do save kv_cache
@@ -2338,6 +2353,8 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
                 sinks=sinks,
+                dequant_scale_q_nope=dequant_scale_q_nope,
+                fp8_kv_scale=fp8_kv_scale,
             )
 
         if not self.use_mla:
@@ -2755,6 +2772,9 @@ class AscendAttnBackend(AttentionBackend):
                 self.forward_metadata.flatten_prefix_block_tables,
                 is_nz=is_fia_nz(),
             )
+            if self.use_mla_fp8:
+                # Prefill still projects the historical latent cache in BF16.
+                kv_cached = (kv_cached.float() * fp8_kv_scale).to(torch.bfloat16)
             k_rope_cached = gather_mla_cache_pages(
                 v_buffer,
                 self.forward_metadata.flatten_prefix_block_tables,
@@ -2980,6 +3000,130 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_output
 
+    def _forward_mla_fp8(
+        self,
+        q,
+        q_rope,
+        layer,
+        forward_batch,
+        dequant_scale_q_nope,
+        fp8_kv_scale,
+        *,
+        is_verify,
+    ):
+        # Same FIA v2 C8 contract for eager and graph decode/static verify.
+        if self.use_sparse_attn_a2a or self.attn_cp_size > 1:
+            raise NotImplementedError(
+                "MLA C8 currently requires non-CP/non-A2A execution"
+            )
+        if dequant_scale_q_nope is None or fp8_kv_scale is None:
+            raise ValueError(
+                "MLA C8 requires Q per-token-head and KV per-tensor descales"
+            )
+        if q.dtype != torch.float8_e4m3fn or q_rope.dtype != torch.bfloat16:
+            raise ValueError("MLA C8 expects FP8 E4M3 Q and BF16 side features")
+
+        padded_tokens = q.shape[0]
+        # Capture the full bucket. Replay updates the KV lengths (zero for
+        # padded requests), not this Python slicing decision or tensor shapes.
+        num_tokens = (
+            padded_tokens
+            if self.graph_mode
+            else forward_batch.num_token_non_padded_cpu
+        )
+        if num_tokens is None:
+            num_tokens = padded_tokens
+        output = torch.zeros(
+            (padded_tokens, layer.tp_q_head_num, self.kv_lora_rank),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        if num_tokens == 0:
+            return output.flatten(1)
+        q = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank)[:num_tokens]
+        q_rope = q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim)[:num_tokens]
+        q_scale = dequant_scale_q_nope.view(-1, layer.tp_q_head_num)[:num_tokens]
+        kv_scale = fp8_kv_scale.reshape(-1).to(device=q.device, dtype=torch.float32)
+
+        if is_verify:
+            spec_info = forward_batch.spec_info
+            if getattr(spec_info, "ragged_verify_layout", None) is not None:
+                raise NotImplementedError(
+                    "MLA C8 target verify currently requires static DSpark blocks"
+                )
+            if forward_batch.forward_mode.is_draft_extend_v2():
+                query_lens = forward_batch.extend_seq_lens_cpu
+                actual_seq_qlen = np.cumsum(query_lens).tolist()
+                batch_size = len(query_lens)
+            else:
+                width = int(spec_info.draft_token_num)
+                if num_tokens % width:
+                    raise ValueError(
+                        "MLA C8 verify requires complete request-major draft blocks"
+                    )
+                batch_size = num_tokens // width
+                actual_seq_qlen = list(range(width, num_tokens + 1, width))
+            input_layout = "TND"
+        else:
+            batch_size = num_tokens
+            actual_seq_qlen = None
+            q = q.unsqueeze(1)
+            q_rope = q_rope.unsqueeze(1)
+            q_scale = q_scale.unsqueeze(1)
+            input_layout = "BSND"
+
+        # DSpark's CPU metadata already includes the verify block. Do not add
+        # its width again; trim DP padding in Q, Q scale and block tables alike.
+        fm = self.forward_metadata
+        kv_lens = fm.seq_lens_cpu_int
+        if kv_lens is None:
+            kv_lens = fm.seq_lens_cpu_list
+        else:
+            kv_lens = kv_lens.tolist()
+        kv_lens = kv_lens[:batch_size]
+        c_kv = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_rope = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        if is_fia_nz():
+            c_kv = _reshape_kv_for_fia_nz(
+                c_kv, layer.tp_k_head_num, self.kv_lora_rank, self.page_size
+            )
+            k_rope = _reshape_kv_for_fia_nz(
+                k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
+            )
+        else:
+            c_kv = c_kv.view(-1, layer.tp_k_head_num, self.page_size, self.kv_lora_rank)
+            k_rope = k_rope.view(
+                -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
+            )
+        live_output = output[:num_tokens]
+        if not is_verify:
+            live_output = live_output.unsqueeze(1)
+        torch_npu.npu_fused_infer_attention_score_v2.out(
+            q.contiguous(),
+            c_kv,
+            c_kv,
+            query_rope=q_rope.contiguous(),
+            key_rope=k_rope,
+            num_query_heads=layer.tp_q_head_num,
+            num_key_value_heads=layer.tp_k_head_num,
+            input_layout=input_layout,
+            softmax_scale=layer.scaling,
+            block_table=fm.block_tables[:batch_size],
+            block_size=self.page_size,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_kvlen=kv_lens,
+            sparse_mode=3 if is_verify else 0,
+            atten_mask=self.mtp_mask if is_verify else None,
+            dequant_scale_query=q_scale.contiguous(),
+            dequant_scale_key=kv_scale,
+            dequant_scale_value=kv_scale,
+            key_quant_mode=0,
+            value_quant_mode=0,
+            query_quant_mode=3,
+            out=[live_output, torch.empty(1, dtype=torch.bfloat16, device=q.device)],
+        )
+        return output.flatten(1)
+
     def forward_mtp(
         self,
         q,
@@ -2991,7 +3135,23 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        dequant_scale_q_nope: Optional[torch.Tensor] = None,
+        fp8_kv_scale: Optional[torch.Tensor] = None,
     ):
+        if self.use_mla_fp8:
+            if save_kv_cache:
+                raise ValueError(
+                    "MLA C8 cache must be written by the quantized prepare path"
+                )
+            return self._forward_mla_fp8(
+                q,
+                q_rope,
+                layer,
+                forward_batch,
+                dequant_scale_q_nope,
+                fp8_kv_scale,
+                is_verify=True,
+            )
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
@@ -3596,6 +3756,8 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
+        dequant_scale_q_nope: Optional[torch.Tensor] = None,
+        fp8_kv_scale: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         if is_mla_preprocess_enabled() and self.use_mla:
@@ -3612,6 +3774,21 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope,
                 k_rope,
                 topk_indices,
+            )
+
+        if self.use_mla_fp8:
+            if save_kv_cache:
+                raise ValueError(
+                    "MLA C8 cache must be written by the quantized prepare path"
+                )
+            return self._forward_mla_fp8(
+                q,
+                q_rope,
+                layer,
+                forward_batch,
+                dequant_scale_q_nope,
+                fp8_kv_scale,
+                is_verify=False,
             )
 
         if self.graph_mode and (not self.enable_torch_compile):
