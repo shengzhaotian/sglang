@@ -1640,12 +1640,19 @@ class KimiK3DeltaAttention(nn.Module):
         # The full-rank [q, k, v, g] merged projection is explicitly sharded
         # with attn_tp_rank/attn_tp_size, so it also supports DP attention.
         # The low-rank fused path still uses full-TP-only projection helpers.
-        # For the full-rank gate (K3) the checkpoint quantizes only the MoE
-        # experts; attention linears resolve to UnquantizedLinearMethod, so a
-        # non-None quant_config is fine for the merged projection.
         self.do_fuse_qkvbfg = quant_config is None and self.attn_tp_size == self.tp_size
+        self.do_fuse_qkvg = self.use_full_rank_gate
+        if self.do_fuse_qkvg and _is_npu and isinstance(quant_config, ModelSlimConfig):
+            # A ModelSlim checkpoint can quantize Q/K/V but keep G in BF16.
+            # Reuse the QKV + separate G path when one shared scheme cannot
+            # represent all four projections; keep the full-rank gate itself.
+            skipped = {
+                quant_config.is_layer_skipped(f"{prefix}.{name}")
+                for name in ("q_proj", "k_proj", "v_proj", "g_proj")
+            }
+            self.do_fuse_qkvg = len(skipped) == 1
 
-        if self.use_full_rank_gate:
+        if self.do_fuse_qkvg:
             # Fuse only the alignment-friendly wide projections [q, k, v, g]
             # (6144/rank at TP8). Folding b (12/rank) and f_a (128, replicated)
             # in as well skews the output dim to 6284 and measurably degrades
@@ -2047,7 +2054,7 @@ class KimiK3DeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        if self.do_fuse_qkvbfg or self.use_full_rank_gate:
+        if self.do_fuse_qkvbfg or self.do_fuse_qkvg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 hidden_states
             )
@@ -3440,11 +3447,10 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if not self.config.is_kda_layer(layer_id):
                         continue
                     layer = self.model.layers[layer_id].self_attn
-                    # Full-rank K3 always instantiates fused_qkvg_proj, including
-                    # ModelSlim-quantized models. The low-rank fused modules are
-                    # still conditional on do_fuse_qkvbfg.
+                    # Mixed-precision ModelSlim QKVG uses the separate QKV/G
+                    # modules even with a full-rank gate.
                     if param_name == ".fused_qkvg_proj":
-                        if not getattr(layer, "use_full_rank_gate", False):
+                        if not layer.do_fuse_qkvg:
                             continue
                     elif not getattr(layer, "do_fuse_qkvbfg", False):
                         continue
