@@ -2800,20 +2800,35 @@ class AscendAttnBackend(AttentionBackend):
                 k_full = torch.cat([k_pre_slice, k_cur_slice], dim=1)
                 v_full = torch.cat([v_pre_slice, v_cur_slice], dim=1)
 
-                attn_output[q_len_offset : q_len_offset + q_len] = (
-                    torch.ops.npu.npu_fused_infer_attention_score(
+                if envs.SGLANG_KIMI_K3_USE_FIA_TILELANG.get():
+                    from kimi_k3_tilelang import flash_attention
+                    flash_attention(
                         q[None, q_len_offset : q_len_offset + q_len],
                         k_full,
                         v_full,
+                        out = attn_output[q_len_offset : q_len_offset + q_len],
                         num_heads=layer.tp_q_head_num,
                         num_key_value_heads=layer.tp_k_head_num,
-                        input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
-                        atten_mask=self.fia_mask,
+                        input_layout="BSND",
                         sparse_mode=3,
                         scale=layer.scaling,
                         next_tokens=0,
-                    )[0]
-                )
+                    )
+                else:
+                    attn_output[q_len_offset : q_len_offset + q_len] = (
+                        torch.ops.npu.npu_fused_infer_attention_score(
+                            q[None, q_len_offset : q_len_offset + q_len],
+                            k_full,
+                            v_full,
+                            num_heads=layer.tp_q_head_num,
+                            num_key_value_heads=layer.tp_k_head_num,
+                            input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
+                            atten_mask=self.fia_mask,
+                            sparse_mode=3,
+                            scale=layer.scaling,
+                            next_tokens=0,
+                        )[0]
+                    )
                 q_len_offset += q_len
                 prefix_len_offset += prefix_len
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
