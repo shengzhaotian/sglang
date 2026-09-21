@@ -344,6 +344,11 @@ class AscendAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.model_dtype = model_runner.model_config.dtype
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self.use_mla_fp8 = (
+            self.use_mla
+            and model_runner.kv_cache_dtype_str == "fp8_e4m3"
+            and not is_deepseek_dsa(model_runner.model_config.hf_text_config)
+        )
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -402,7 +407,7 @@ class AscendAttnBackend(AttentionBackend):
             self.ascend_attn_mask_builder.mixed_chunk_attn_mask,
         )
         if self.use_mla:
-            if self.use_flash_mla:
+            if self.use_flash_mla and not self.use_mla_fp8:
                 self.mtp_mask = self.mtp_mask.to(torch.int8)
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
         self.is_hybrid_swa = model_runner.is_hybrid_swa
@@ -416,7 +421,12 @@ class AscendAttnBackend(AttentionBackend):
             and self.token_to_kv_pool.swa_layer_nums > 0
         )
 
-        self.needs_cpu_seq_lens = envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get()
+        # C8 FIA v2 and NPUGraph.update consume host KV lengths, including
+        # DSpark's final verify boundary. The device-only opt-out is not valid
+        # for this operator, even when attention TP A2A is enabled.
+        self.needs_cpu_seq_lens = (
+            envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get() # or self.use_mla_fp8
+        )
 
         # AllToAll optimization for sparse attention across attention TP ranks
         self.use_sparse_attn_a2a = (
@@ -882,7 +892,7 @@ class AscendAttnBackend(AttentionBackend):
                     device=seq_lens.device,
                 )
         device = seq_lens.device
-        if self.use_mla and self.use_flash_mla:
+        if self.use_mla and self.use_flash_mla and not self.use_mla_fp8:
             def _calculate_metadata_size(batch_size, aic_core_num, aiv_core_num):
                 """计算 metadata tensor 的对齐后大小。
 
@@ -1010,6 +1020,14 @@ class AscendAttnBackend(AttentionBackend):
             if total_pages < metadata.block_tables.shape[1]:
                 metadata.block_tables[:bs, total_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
+
+        if self.use_mla_fp8:
+            # FIA v2 reads the stable page table above; NPUGraph.update replaces
+            # its host KV lengths on replay. It does not consume FlashMLA's
+            # BF16 metadata or the device-side speculative length adjustment.
+            self.forward_metadata = metadata
+            self.graph_mode = True
+            return
 
         if self.use_mla and self.use_flash_mla:
             query_seq_len = (
@@ -2565,6 +2583,8 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
+        dequant_scale_q_nope: Optional[torch.Tensor] = None,
+        fp8_kv_scale: Optional[torch.Tensor] = None,
     ):
         if is_mla_preprocess_enabled() and self.use_mla:
             # MLAPO and MLAPROLOG do save kv_cache
@@ -2606,6 +2626,8 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
                 sinks=sinks,
+                dequant_scale_q_nope=dequant_scale_q_nope,
+                fp8_kv_scale=fp8_kv_scale,
             )
 
         if not self.use_mla:
@@ -3023,6 +3045,9 @@ class AscendAttnBackend(AttentionBackend):
                 self.forward_metadata.flatten_prefix_block_tables,
                 is_nz=is_fia_nz(),
             )
+            if self.use_mla_fp8:
+                # Prefill still projects the historical latent cache in BF16.
+                kv_cached = (kv_cached.float() * fp8_kv_scale).to(torch.bfloat16)
             k_rope_cached = gather_mla_cache_pages(
                 v_buffer,
                 self.forward_metadata.flatten_prefix_block_tables,
@@ -3248,6 +3273,243 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_output
 
+    def _forward_mla_fp8(
+        self,
+        q,
+        q_rope,
+        layer,
+        forward_batch,
+        dequant_scale_q_nope,
+        fp8_kv_scale,
+        *,
+        is_verify,
+    ):
+        # Same FIA v2 C8 contract for eager and graph decode/static verify.
+        if self.attn_cp_size > 1:
+            raise NotImplementedError("MLA C8 currently requires non-CP execution")
+        use_a2a = self.use_sparse_attn_a2a
+        if use_a2a and layer.tp_k_head_num != 1:
+            raise NotImplementedError("MLA C8 A2A requires a replicated single KV head")
+        if dequant_scale_q_nope is None or fp8_kv_scale is None:
+            raise ValueError(
+                "MLA C8 requires Q per-token-head and KV per-tensor descales"
+            )
+        if q.dtype != torch.float8_e4m3fn or q_rope.dtype != torch.bfloat16:
+            raise ValueError("MLA C8 expects FP8 E4M3 Q and BF16 side features")
+
+        padded_tokens = q.shape[0]
+        # Capture the full bucket. Replay updates the KV lengths (zero for
+        # padded requests), not this Python slicing decision or tensor shapes.
+        num_tokens = (
+            padded_tokens
+            if self.graph_mode
+            else forward_batch.num_token_non_padded_cpu
+        )
+        if num_tokens is None:
+            num_tokens = padded_tokens
+        output = torch.zeros(
+            (padded_tokens, layer.tp_q_head_num, self.kv_lora_rank),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        if num_tokens == 0:
+            return output.flatten(1)
+        q = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank)[:num_tokens]
+        q_rope = q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim)[:num_tokens]
+        q_scale = dequant_scale_q_nope.view(-1, layer.tp_q_head_num)[:num_tokens]
+        kv_scale = fp8_kv_scale.reshape(-1).to(device=q.device, dtype=torch.float32)
+
+        width = 1
+        if is_verify:
+            spec_info = forward_batch.spec_info
+            if getattr(spec_info, "ragged_verify_layout", None) is not None:
+                raise NotImplementedError(
+                    "MLA C8 target verify currently requires static DSpark blocks"
+                )
+            if forward_batch.forward_mode.is_draft_extend_v2():
+                if use_a2a:
+                    raise NotImplementedError(
+                        "MLA C8 A2A requires decode or static target-verify blocks"
+                    )
+                query_lens = forward_batch.extend_seq_lens_cpu
+                actual_seq_qlen = np.cumsum(query_lens).tolist()
+                batch_size = len(query_lens)
+            else:
+                width = int(spec_info.draft_token_num)
+                if num_tokens % width:
+                    raise ValueError(
+                        "MLA C8 verify requires complete request-major draft blocks"
+                    )
+                batch_size = num_tokens // width
+                actual_seq_qlen = list(range(width, num_tokens + 1, width))
+            input_layout = "TND"
+        else:
+            batch_size = num_tokens
+            actual_seq_qlen = None
+            input_layout = "BSND"
+
+        # DSpark's CPU metadata already includes the verify block. Do not add
+        # its width again; trim DP padding in Q, Q scale and block tables alike.
+        fm = self.forward_metadata
+        kv_lens = fm.seq_lens_cpu_int
+        if kv_lens is None:
+            kv_lens = fm.seq_lens_cpu_list
+        else:
+            kv_lens = kv_lens.tolist()
+        kv_lens = kv_lens[:batch_size]
+        block_table = fm.block_tables[:batch_size]
+        num_query_heads = layer.tp_q_head_num
+        live_output = output[:num_tokens]
+        if use_a2a:
+            parallel = get_parallel()
+            tp_size = parallel.attn_tp_size
+            tp_group = parallel.attn_tp_group
+            t_padded, t_local, local_bs, padded_bs = self._a2a_fias_v2_sizes(
+                batch_size, tp_size, width
+            )
+            req_start = parallel.attn_tp_rank * local_bs
+            # As in BF16 A2A, trade request rows for all Q heads. Transport
+            # mixed dtypes as bytes: no FP8 collective or numerical cast, and
+            # the per-token-head scale travels with its exact Q/side pair.
+            q_bytes = self.kv_lora_rank * q.element_size()
+            side_bytes = self.qk_rope_head_dim * q_rope.element_size()
+            packed = torch.cat(
+                (
+                    q.contiguous().view(torch.uint8),
+                    q_rope.contiguous().view(torch.uint8),
+                    q_scale.unsqueeze(-1).contiguous().view(torch.uint8),
+                ),
+                dim=-1,
+            )
+            if t_padded > num_tokens:
+                padding = packed.new_zeros(
+                    t_padded - num_tokens, num_query_heads, packed.shape[-1]
+                )
+                padding[..., q_bytes + side_bytes :] = torch.ones(
+                    1, dtype=torch.float32, device=q.device
+                ).view(torch.uint8)
+                packed = torch.cat((packed, padding), dim=0)
+            received = torch.empty_like(packed)
+            tp_group.all_to_all_single(received.view(-1), packed.view(-1))
+            packed = (
+                received.view(tp_size, t_local, num_query_heads, -1)
+                .transpose(0, 1)
+                .contiguous()
+                .view(t_local, tp_size * num_query_heads, -1)
+            )
+            num_query_heads *= tp_size
+            q = packed[..., :q_bytes].contiguous().view(torch.float8_e4m3fn)
+            q_rope = (
+                packed[..., q_bytes : q_bytes + side_bytes]
+                .contiguous()
+                .view(torch.bfloat16)
+            )
+            q_scale = (
+                packed[..., q_bytes + side_bytes :]
+                .contiguous()
+                .view(torch.float32)
+                .squeeze(-1)
+            )
+            kv_lens = (kv_lens + [0] * (padded_bs - batch_size))[
+                req_start : req_start + local_bs
+            ]
+            if padded_bs > batch_size:
+                block_table = torch.cat(
+                    (
+                        block_table,
+                        block_table.new_zeros(
+                            padded_bs - batch_size, block_table.shape[1]
+                        ),
+                    ),
+                    dim=0,
+                )
+            # These are captured tensor operations, so replay reads the
+            # refreshed full page table rather than a stale Python-side copy.
+            block_table = block_table[req_start : req_start + local_bs]
+            if is_verify:
+                actual_seq_qlen = list(range(width, t_local + 1, width))
+            live_output = output.new_empty(t_local, num_query_heads, self.kv_lora_rank)
+
+        if not is_verify:
+            q = q.unsqueeze(1)
+            q_rope = q_rope.unsqueeze(1)
+            q_scale = q_scale.unsqueeze(1)
+            live_output = live_output.unsqueeze(1)
+        c_kv = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_rope = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        if is_fia_nz():
+            c_kv = _reshape_kv_for_fia_nz(
+                c_kv, layer.tp_k_head_num, self.kv_lora_rank, self.page_size
+            )
+            k_rope = _reshape_kv_for_fia_nz(
+                k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
+            )
+        else:
+            c_kv = c_kv.view(-1, layer.tp_k_head_num, self.page_size, self.kv_lora_rank)
+            k_rope = k_rope.view(
+                -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
+            )
+        from fia_decode_c8_tilelang_h24 import fia_decode_c8, workspace_numel
+        workspace = torch.empty(workspace_numel(batch_size, 4), dtype=torch.float32, device=q.device)
+        fia_decode_c8(
+            q.contiguous(),
+            c_kv.squeeze(1),
+            q_rope.contiguous(),
+            k_rope.squeeze(1),
+            block_table,
+            self.forward_metadata.seq_lens.to(torch.int64),
+            q_scale.contiguous(),
+            kv_scale,
+            out = live_output,
+            workspace = workspace,
+            seq_len = None,
+            num_cores = 32,
+            splits = 4
+        )
+
+        # torch_npu.npu_fused_infer_attention_score_v2.out(
+        #     q.contiguous(),
+        #     c_kv,
+        #     c_kv,
+        #     query_rope=q_rope.contiguous(),
+        #     key_rope=k_rope,
+        #     num_query_heads=num_query_heads,
+        #     num_key_value_heads=layer.tp_k_head_num,
+        #     input_layout=input_layout,
+        #     softmax_scale=layer.scaling,
+        #     block_table=block_table,
+        #     block_size=self.page_size,
+        #     actual_seq_qlen=actual_seq_qlen,
+        #     actual_seq_kvlen=kv_lens,
+        #     sparse_mode=3 if is_verify else 0,
+        #     atten_mask=self.mtp_mask if is_verify else None,
+        #     dequant_scale_query=q_scale.contiguous(),
+        #     dequant_scale_key=kv_scale,
+        #     dequant_scale_value=kv_scale,
+        #     key_quant_mode=0,
+        #     value_quant_mode=0,
+        #     query_quant_mode=3,
+        #     out=[live_output, torch.empty(1, dtype=torch.bfloat16, device=q.device)],
+        # )
+        if use_a2a:
+            # Return each source rank's head shard in the original token order.
+            send_output = (
+                live_output.view(
+                    t_local, tp_size, layer.tp_q_head_num, self.kv_lora_rank
+                )
+                .transpose(0, 1)
+                .contiguous()
+                .view(-1)
+            )
+            recv_output = torch.empty_like(send_output)
+            tp_group.all_to_all_single(recv_output, send_output)
+            output[:num_tokens].copy_(
+                recv_output.view(t_padded, layer.tp_q_head_num, self.kv_lora_rank)[
+                    :num_tokens
+                ]
+            )
+        return output.flatten(1)
+
     def forward_mtp(
         self,
         q,
@@ -3259,7 +3521,23 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        dequant_scale_q_nope: Optional[torch.Tensor] = None,
+        fp8_kv_scale: Optional[torch.Tensor] = None,
     ):
+        if self.use_mla_fp8:
+            if save_kv_cache:
+                raise ValueError(
+                    "MLA C8 cache must be written by the quantized prepare path"
+                )
+            return self._forward_mla_fp8(
+                q,
+                q_rope,
+                layer,
+                forward_batch,
+                dequant_scale_q_nope,
+                fp8_kv_scale,
+                is_verify=True,
+            )
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
@@ -4004,6 +4282,8 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
+        dequant_scale_q_nope: Optional[torch.Tensor] = None,
+        fp8_kv_scale: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         if is_mla_preprocess_enabled() and self.use_mla:
@@ -4020,6 +4300,21 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope,
                 k_rope,
                 topk_indices,
+            )
+
+        if self.use_mla_fp8:
+            if save_kv_cache:
+                raise ValueError(
+                    "MLA C8 cache must be written by the quantized prepare path"
+                )
+            return self._forward_mla_fp8(
+                q,
+                q_rope,
+                layer,
+                forward_batch,
+                dequant_scale_q_nope,
+                fp8_kv_scale,
+                is_verify=False,
             )
 
         if self.graph_mode and (not self.enable_torch_compile):

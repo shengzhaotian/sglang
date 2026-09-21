@@ -12,7 +12,10 @@ def gather_mla_cache_pages(
     [blocks, head_dim // 16, page_size, 16]. Restore token-major order before
     projecting cached latent vectors or concatenating their RoPE features.
     """
-    pages = torch.index_select(cache, 0, block_ids)
+    if cache.dtype==torch.float8_e4m3fn:
+        pages = torch.index_select(cache.view(torch.uint8), 0, block_ids).view(torch.float8_e4m3fn)
+    else:
+        pages = torch.index_select(cache, 0, block_ids)
     if not is_nz:
         return pages
     page_size, head_dim = cache.shape[1], cache.shape[-1]

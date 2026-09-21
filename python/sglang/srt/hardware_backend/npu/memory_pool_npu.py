@@ -608,6 +608,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             and kv_cache_dim is not None
             and kv_cache_dim != kv_lora_rank + qk_rope_head_dim
         )
+        # Ordinary MLA C8 has a per-layer scale and an unquantized RoPE side.
+        # Keep the existing DSA packed-cache contract separate.
+        self.mla_kv_cache_store_fp8 = (
+            dtype == torch.float8_e4m3fn and index_head_dim is None
+        )
         self.kv_cache_dim = (
             kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
         )
@@ -626,6 +631,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
             self.k_store_dtype = torch.float8_e4m3fn
             self.v_store_dtype = torch.bfloat16
+        elif self.mla_kv_cache_store_fp8:
+            self.k_store_dtype = torch.float8_e4m3fn
+            self.v_store_dtype = torch.bfloat16
 
         self.custom_mem_pool = None
 
@@ -634,7 +642,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             # k_buffer (c_kv, kv_cache_dim) and v_buffer (k_rope, kr_cache_dim) are
             # merged into a single contiguous kv_buffer so that get_kv_buffer returns
             # one tensor and callers no longer need torch.cat at the call site.
-            if self.use_flash_mla:
+            # Ordinary C8 always keeps FP8 latent and BF16 RoPE separate.
+            if self.use_flash_mla and not self.mla_kv_cache_store_fp8:
                 self.kv_buffer = torch.zeros(
                     (
                         layer_num,
@@ -705,7 +714,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self._finalize_allocation_log(size)
 
     def get_kv_size_bytes(self):
-        if self.use_flash_mla:
+        if self.use_flash_mla and not self.mla_kv_cache_store_fp8:
             assert hasattr(self, "kv_buffer")
             kv_size_bytes = 0
             for kv_cache in self.kv_buffer:
@@ -729,13 +738,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_kv_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        if self.use_flash_mla:
+        if self.use_flash_mla and not self.mla_kv_cache_store_fp8:
             return self.kv_buffer[layer_id - self.start_layer]
         else:
             return (
                 self.k_buffer[layer_id - self.start_layer],
                 self.v_buffer[layer_id - self.start_layer],
             )
+
+    def _clear_buffers(self):
+        if self.mla_kv_cache_store_fp8:
+            del self.k_buffer, self.v_buffer
+        else:
+            super()._clear_buffers()
 
     def get_state_buf_infos(self):
         if self.index_head_dim is None:
@@ -751,6 +766,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        if self.mla_kv_cache_store_fp8:
+            return self.k_buffer[layer_id - self.start_layer]
         if self.use_flash_mla:
             buf = self.kv_buffer[layer_id - self.start_layer]
             k_slice = buf[..., : self.kv_cache_dim]
@@ -765,6 +782,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        if self.mla_kv_cache_store_fp8:
+            return self.v_buffer[layer_id - self.start_layer]
         if self.use_flash_mla:
             buf = self.kv_buffer[layer_id - self.start_layer]
             v_slice = buf[..., self.kv_cache_dim :]
@@ -796,6 +815,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     # for disagg
     def get_contiguous_buf_infos(self):
+        if self.mla_kv_cache_store_fp8:
+            raise NotImplementedError(
+                "Split FP8/BF16 MLA cache transfer is not supported; "
+                "the hybrid pool's transfer layer mapping must be adapted first."
+            )
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
         kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)]
         kv_data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)]
@@ -916,6 +940,34 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
 
+        if self.mla_kv_cache_store_fp8:
+            scale = getattr(layer, "fak_descale_float", None)
+            if scale is None or scale.numel() != 1:
+                raise ValueError("MLA C8 cache writes require a per-tensor KV descale")
+            # The model validates scale values once after weight loading. Avoid
+            # a tensor-to-host check here so decode/verify writes can be captured.
+            scale = scale.to(device=cache_k.device, dtype=torch.float32)
+            cache_k = (
+                (cache_k.float() / scale.reshape(()))
+                .clamp(-448.0, 448.0)
+                .to(self.k_store_dtype)
+            )
+            cache_v = cache_v.to(self.v_store_dtype)
+            if self.use_fia_nz:
+                self._set_fia_nz_kv_buffer(layer_id, loc, cache_k, cache_v)
+            else:
+                offset = layer_id - self.start_layer
+                for buffer, values, dim in (
+                    (self.k_buffer[offset], cache_k, self.kv_lora_rank),
+                    (self.v_buffer[offset], cache_v, self.qk_rope_head_dim),
+                ):
+                    torch_npu.npu_scatter_nd_update_(
+                        buffer.view(-1, 1, dim),
+                        loc.view(-1, 1),
+                        values.reshape(-1, 1, dim),
+                    )
+            return
+
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
@@ -974,7 +1026,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             torch_npu.npu_scatter_nd_update_(dst, indices, src)
         offset = layer_id - self.start_layer
 
-        if self.use_flash_mla:
+        if self.use_flash_mla and not self.mla_kv_cache_store_fp8:
             kv_layer = self.kv_buffer[offset]
             k_slice = kv_layer[..., : self.kv_cache_dim]
             v_slice = kv_layer[..., self.kv_cache_dim :]
@@ -983,6 +1035,27 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         else:
             scatter(self.k_buffer[offset], cache_k, self.kv_lora_rank)
             scatter(self.v_buffer[offset], cache_v, self.qk_rope_head_dim)
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if not self.mla_kv_cache_store_fp8:
+            return super().move_kv_cache(tgt_loc, src_loc)
+        # Use bytes for FP8 indexing; preserve both parts when accepted draft
+        # tokens are relocated, including overlapping source/destination slots.
+        for buffers, dim in (
+            (self.k_buffer, self.kv_lora_rank),
+            (self.v_buffer, self.qk_rope_head_dim),
+        ):
+            if self.use_fia_nz:
+                target = _mla_fia_nz_scatter_indices(tgt_loc, dim, self.page_size)
+                source = _mla_fia_nz_scatter_indices(src_loc, dim, self.page_size)
+                row_dim = 16
+            else:
+                target, source, row_dim = tgt_loc, src_loc, dim
+            for buffer in buffers:
+                if buffer.dtype == torch.float8_e4m3fn:
+                    buffer = buffer.view(torch.uint8)
+                rows = buffer.view(-1, row_dim)
+                rows[target.reshape(-1).long()] = rows[source.reshape(-1).long()]
 
     def set_index_k_buffer(
         self,
@@ -1041,6 +1114,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return buffers
 
     def get_cpu_copy(self, indices, mamba_indices=None):
+        if self.mla_kv_cache_store_fp8:
+            raise NotImplementedError("Split FP8/BF16 MLA cache offload is not supported")
         torch.npu.synchronize()
         buf_of_layers = [
             self._get_cpu_offload_layer_buffers(i) for i in range(self.layer_num)
@@ -1050,6 +1125,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        if self.mla_kv_cache_store_fp8:
+            raise NotImplementedError("Split FP8/BF16 MLA cache offload is not supported")
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):

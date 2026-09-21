@@ -326,14 +326,16 @@ class DFlashAttention(nn.Module):
         we only need K/V for the cached tokens; Q is never consumed.
         """
         # Fast path for unquantized weights: slice the fused QKV weight and run one GEMM.
-        can_slice_qkv_weight, _ = can_dflash_slice_qkv_weight(self.qkv_proj)
+        # can_slice_qkv_weight, _ = can_dflash_slice_qkv_weight(self.qkv_proj)
+        can_slice_qkv_weight = False
         if can_slice_qkv_weight:
             kv_slice = slice(self.q_size, self.q_size + 2 * self.kv_size)
             weight = self.qkv_proj.weight[kv_slice]
             bias = (
                 self.qkv_proj.bias[kv_slice] if self.qkv_proj.bias is not None else None
             )
-            kv = F.linear(hidden_states, weight, bias)
+            kv = F.linear(hidden_states, weight, bias) # [24,1536]
+            #kv = torch.ones([24,1536], dtype=hidden_states.dtype, device=hidden_state.device)
             k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
             return k, v
 

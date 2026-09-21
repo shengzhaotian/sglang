@@ -26,6 +26,15 @@ if TYPE_CHECKING:
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 
+def _get_fp8_kv_runtime_scale(m, attr_name):
+    # DSA's per-token packed cache has a separate quantization contract.
+    if m.kv_cache_dtype != "fp8_e4m3" or m.use_dsa:
+        return None
+    if not getattr(m, "_modelslim_fp8_kv_scale_ready", False):
+        raise RuntimeError("MLA C8 requires loaded ModelSlim FA K/V scales")
+    return getattr(m, attr_name)
+
+
 # region MHA
 def forward_mha_prepare_npu(
     m: "DeepseekV2AttentionMLA",
@@ -35,6 +44,7 @@ def forward_mha_prepare_npu(
     zero_allocator: "BumpAllocator",
     layer_scatter_modes,
 ):
+    fp8_kv_scale = _get_fp8_kv_runtime_scale(m, "fak_descale_float")
     if m.q_lora_rank is not None:
         q, latent_cache = (
             get_attn_tp_context()
@@ -90,13 +100,16 @@ def forward_mha_prepare_npu(
         )
         q_pe = q_pe.reshape(B, -1, m.qk_rope_head_dim)
 
-        if envs.SGLANG_NPU_USE_FLASH_MLA.get():
-            kv_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
+        pool = get_token_to_kv_pool()
+        if fp8_kv_scale is not None:
+            ckv_cache = pool.get_key_buffer(m.layer_id)
+            k_rope_cache = pool.get_value_buffer(m.layer_id)
+        elif envs.SGLANG_NPU_USE_FLASH_MLA.get():
+            kv_cache = pool.get_kv_buffer(m.layer_id)
             ckv_cache = kv_cache[..., : m.kv_lora_rank]
             k_rope_cache = kv_cache[..., m.kv_lora_rank :]
         else:
-            ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
-
+            ckv_cache, k_rope_cache = pool.get_kv_buffer(m.layer_id)
         _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
             latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
             m.kv_a_layernorm.weight,
@@ -106,7 +119,7 @@ def forward_mha_prepare_npu(
             k_rope_cache,
             ckv_cache,
             k_rope_scale=None,
-            c_kv_scale=None,
+            c_kv_scale=_get_fp8_kv_runtime_scale(m, "fak_descale_reciprocal"),
             k_rope_offset=None,
             c_kv_offset=None,
             epsilon=m.kv_a_layernorm.variance_epsilon,
@@ -133,7 +146,7 @@ def forward_mha_prepare_npu(
     v = kv[..., m.qk_nope_head_dim :]
 
     k = m._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
-    return q, k, v, forward_batch
+    return q, k, v, forward_batch, fp8_kv_scale
 
 
 def forward_mha_core_npu(
@@ -142,12 +155,18 @@ def forward_mha_core_npu(
     k: torch.Tensor,
     v: torch.Tensor,
     forward_batch: "ForwardBatch",
+    fp8_kv_scale: Optional[torch.Tensor] = None,
     # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its gate
     # to inner_state, so every *_core dispatched from forward_core takes it as
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    attn_output = m.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+    attention_kwargs = {}
+    if fp8_kv_scale is not None:
+        attention_kwargs["fp8_kv_scale"] = fp8_kv_scale
+    attn_output = m.attn_mha(
+        q, k, v, forward_batch, save_kv_cache=False, **attention_kwargs
+    )
     attn_output = attn_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     if gate is not None:
         attn_output = m._apply_gated(attn_output, gate)
@@ -167,7 +186,11 @@ def forward_mla_prepare_npu(
     zero_allocator: "BumpAllocator",
     layer_scatter_modes,
 ):
-    if is_mla_preprocess_enabled():
+    fp8_kv_scale = _get_fp8_kv_runtime_scale(m, "fak_descale_float")
+    dequant_scale_q_nope = None
+    # Keep the existing fused path unchanged. C8 uses the explicit preparation
+    # below, which also supports Kimi's NoPE (rotary_emb=None) attention.
+    if is_mla_preprocess_enabled() and fp8_kv_scale is None:
         if not hasattr(m, "mla_preprocess"):
             m.mla_preprocess = NPUFusedMLAPreprocess(
                 m.fused_qkv_a_proj_with_mqa,
@@ -281,6 +304,21 @@ def forward_mla_prepare_npu(
                 layer_id=m.layer_id,
             )
 
+    if fp8_kv_scale is not None:
+        # Quantize the absorbed Q per token/head, as in PR #29641. The BF16
+        # 64-D branch is not quantized, including when Kimi skips rotation.
+        q_shape = q_nope_out.shape
+        q_nope_out, dequant_scale_q_nope = torch_npu.npu_dynamic_quant(
+            q_nope_out.reshape(-1, q_shape[-1]), dst_type=torch.float8_e4m3fn
+        )
+        q_nope_out = q_nope_out.view(q_shape)
+        dequant_scale_q_nope = dequant_scale_q_nope.view(*q_shape[:-1], 1).float()
+        # FIA's MLA C8 interface requires this compensation for the BF16 term.
+        q_pe = (q_pe / dequant_scale_q_nope / fp8_kv_scale).to(torch.bfloat16)
+        get_token_to_kv_pool().set_kv_buffer(
+            m, forward_batch.out_cache_loc, k_nope, k_pe
+        )
+
     return (
         q_pe,
         k_pe,
@@ -290,6 +328,7 @@ def forward_mla_prepare_npu(
         zero_allocator,
         positions,
         topk_indices,
+        dequant_scale_q_nope,
     )
 
 
@@ -303,11 +342,21 @@ def forward_mla_core_npu(
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
     topk_indices: torch.Tensor,
+    dequant_scale_q_nope: Optional[torch.Tensor] = None,
     # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its gate
     # to inner_state, so every *_core dispatched from forward_core takes it as
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    attention_kwargs = {}
+    if topk_indices is not None:
+        attention_kwargs["topk_indices"] = topk_indices
+    if dequant_scale_q_nope is not None:
+        attention_kwargs.update(
+            dequant_scale_q_nope=dequant_scale_q_nope,
+            fp8_kv_scale=_get_fp8_kv_runtime_scale(m, "fak_descale_float"),
+            save_kv_cache=False,
+        )
     attn_output = m.attn_mqa(
         q_nope_out,
         k_nope,
@@ -315,7 +364,7 @@ def forward_mla_core_npu(
         forward_batch,
         q_rope=q_pe,
         k_rope=k_pe,
-        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+        **attention_kwargs,
     )
 
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
