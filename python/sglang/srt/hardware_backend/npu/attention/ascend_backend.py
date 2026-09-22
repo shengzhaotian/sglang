@@ -3011,6 +3011,8 @@ class AscendAttnBackend(AttentionBackend):
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
+            from kimi_k3_tilelang import cat_cat_flash_attention_tnd
+
             # This branch adds support for prefix cache for GLM-4.7-Flash.
             # When using the MLA architecture, if qk head dim equals v head dim and the head count is not a power of 2,
             # we use the FIA kernel for computation.
@@ -3035,48 +3037,46 @@ class AscendAttnBackend(AttentionBackend):
             )
             k_nope, v_pre = kv.split([self.qk_nope_head_dim, layer.v_head_dim], dim=-1)
 
-            k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
-            k_pre = torch.cat([k_nope, k_rope], dim=-1)
-
-            attn_output = torch.empty(
-                (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
-                device=q.device,
-                dtype=q.dtype,
-            )
-            q_len_offset = 0
-            prefix_len_offset = 0
+            actual_seq_lengths, prefix_lengths, prefix_offsets = [], [], []
+            q_len_offset = prefix_len_offset = 0
             for q_len, prefix_len in zip(
                 self.forward_metadata.extend_seq_lens_cpu_int,
                 self.forward_metadata.prefix_lens,
             ):
-                k_cur_slice = k[None, q_len_offset : q_len_offset + q_len]
-                v_cur_slice = v[None, q_len_offset : q_len_offset + q_len]
-                k_pre_slice = k_pre[
-                    None, prefix_len_offset : prefix_len_offset + prefix_len
-                ]
-                v_pre_slice = v_pre[
-                    None, prefix_len_offset : prefix_len_offset + prefix_len
-                ]
-
-                k_full = torch.cat([k_pre_slice, k_cur_slice], dim=1)
-                v_full = torch.cat([v_pre_slice, v_cur_slice], dim=1)
-
-                attn_output[q_len_offset : q_len_offset + q_len] = (
-                    torch.ops.npu.npu_fused_infer_attention_score(
-                        q[None, q_len_offset : q_len_offset + q_len],
-                        k_full,
-                        v_full,
-                        num_heads=layer.tp_q_head_num,
-                        num_key_value_heads=layer.tp_k_head_num,
-                        input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
-                        atten_mask=self.fia_mask,
-                        sparse_mode=3,
-                        scale=layer.scaling,
-                        next_tokens=0,
-                    )[0]
-                )
+                q_len, prefix_len = int(q_len), int(prefix_len)
                 q_len_offset += q_len
-                prefix_len_offset += prefix_len
+                if q_len > 0:
+                    actual_seq_lengths.append(q_len_offset)
+                    prefix_lengths.append(prefix_len)
+                    prefix_offsets.append(prefix_len_offset)
+                prefix_len_offset += (
+                    (prefix_len + self.page_size - 1) // self.page_size * self.page_size
+                )
+
+            attn_output = q.new_empty(
+                (q.size(0), layer.tp_q_head_num, layer.v_head_dim)
+            )
+            if q_len_offset > 0:
+                cat_cat_flash_attention_tnd(
+                    q[:q_len_offset],
+                    k[:q_len_offset],
+                    v[:q_len_offset],
+                    k_nope,
+                    k_rope_cached,
+                    v_pre,
+                    out=attn_output[:q_len_offset],
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    actual_seq_lengths=actual_seq_lengths,
+                    prefix_lengths=prefix_lengths,
+                    prefix_offsets=prefix_offsets,
+                    sparse_mode=3,
+                    scale=layer.scaling,
+                    next_tokens=0,
+                )
+            if q_len_offset < q.size(0):
+                attn_output[q_len_offset:].zero_()
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
             if layer.qk_head_dim == layer.v_head_dim:
