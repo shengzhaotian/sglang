@@ -3399,9 +3399,9 @@ class AscendAttnBackend(AttentionBackend):
         block_table = fm.block_tables[:batch_size]
         num_query_heads = layer.tp_q_head_num
         live_output = output[:num_tokens]
+        parallel = get_parallel()
+        tp_size = parallel.attn_tp_size
         if use_a2a:
-            parallel = get_parallel()
-            tp_size = parallel.attn_tp_size
             tp_group = parallel.attn_tp_group
             t_padded, t_local, local_bs, padded_bs = self._a2a_fias_v2_sizes(
                 batch_size, tp_size, width
@@ -3489,7 +3489,10 @@ class AscendAttnBackend(AttentionBackend):
             k_rope = k_rope.view(
                 -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
             )
-        from fia_decode_c8_tilelang_h24 import fia_decode_c8, workspace_numel
+        if tp_size == 8:
+            from fia_decode_c8_tilelang_h96 import fia_decode_c8, workspace_numel
+        elif tp_size == 4:
+            from fia_decode_c8_tilelang_h24 import fia_decode_c8, workspace_numel
         workspace = torch.empty(
             workspace_numel(block_table.shape[0], 4),
             dtype=torch.float32,
