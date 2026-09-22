@@ -787,12 +787,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         use_mxfp8 = envs.SGLANG_NPU_DISPATCH_MXFP8.get()
         use_mxfp8_opts = (
             dict(use_mxfp8=use_mxfp8)
-            if self.use_fp8
+            if use_mxfp8
             else dict()
         )
         quant_mode_opts = (
             dict(quant_mode=self.quant_mode)
-            if self.quant_mode is not None
+            if self.quant_mode is not None and not use_mxfp8
             else dict()
         )
 
@@ -804,7 +804,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 topk_ids,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
-                use_fp8=use_mxfp8 or self.use_fp8,
+                use_fp8=self.use_fp8 if not use_mxfp8 else False,
                 **(
                     dict(topk_weights=topk_weights)
                     if _is_npu and not _use_zbal
