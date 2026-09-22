@@ -367,7 +367,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             nz_shapes = [(7168, 12288), (12288, 7168), (3072, 7168), (7168, 3072)]
         else:
             # only for kimi-k3 attn-tp=8
-            nz_shapes = [(7168, 6144), (6144, 7168), (1536, 7168), (7168, 1536)]
+            nz_shapes = [(7168, 6144), (6144, 7168), (1536, 7168), (7168, 1536), (3072, 7168), (7168, 3072)]
         if _is_npu and layer.weight.shape in nz_shapes:
             from sglang.srt.hardware_backend.npu.utils import npu_format_cast
             layer.weight.data = npu_format_cast(layer.weight.data)

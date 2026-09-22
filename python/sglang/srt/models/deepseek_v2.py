@@ -1951,6 +1951,9 @@ class DeepseekV2AttentionMLA(
         self.w_kc = None
         self.w_vc = None
         self.w_scale = 1.0
+        if _is_npu:
+            self.kv_quant_method = None
+            self._init_kv_quant_weights(quant_config, prefix)
 
         # Full-head Q/absorb weights for --dcp-replicate-q-proj, gathered once
         # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
@@ -1989,6 +1992,19 @@ class DeepseekV2AttentionMLA(
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
+
+    def _init_kv_quant_weights(self, quant_config, prefix: str) -> None:
+        if not _is_npu or quant_config is None:
+            return
+        self.kv_quant_method = quant_config.get_quant_method(self, prefix=prefix)
+        if self.kv_quant_method is not None:
+            self.kv_quant_method.create_weights(
+                self, num_heads=self.num_local_heads, num_kv_heads=1
+            )
+
+    def refresh_fa_k_scale_params(self) -> None:
+        if _is_npu and self.kv_quant_method is not None:
+            self.kv_quant_method.process_weights_after_loading(self)
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
