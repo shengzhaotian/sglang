@@ -311,7 +311,7 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             weight_scale=weight_scale.view(torch.float8_e8m0fnu),
             weight_assist_matrix=None,
             bias=None,
-            x_scale=pertoken_scale,
+            x_scale=pertoken_scale.view(torch.float8_e8m0fnu),
             smooth_scale=None,
             group_list=expert_tokens.to(torch.int64),
             dequant_mode=1,

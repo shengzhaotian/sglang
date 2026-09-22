@@ -647,6 +647,7 @@ class _AscendKDAExtendKernel:
             )
         return o, final_state, h
 
+
 class AscendKDAAttnBackend(KDAAttnBackend):
     """Ascend implementation of Kimi Delta Attention.
 
@@ -681,13 +682,6 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             )
         )
         self.kernel_dispatcher.extend_kernel = _AscendKDAExtendKernel()
-
-        # Per-step layout tensors reused across all layers during target
-        # verify.  Invalidated when (batch_size, draft_token_num, device)
-        # changes so we only build them once per forward step.
-        self._verify_layout_key = None
-        self._verify_num_accepted_tokens = None
-        self._verify_dense_cu_seqlens = None
 
     def _get_conv_weights_t(
         self, layer: RadixLinearAttention, dtype: torch.dtype
@@ -1011,28 +1005,19 @@ class AscendKDAAttnBackend(KDAAttnBackend):
 
         intermediate_indices = self.verify_intermediate_state_indices[:batch_size]
         conv_states = cache.conv[0]
-
-        # num_accepted_tokens / dense_query_start_loc / dense_cu_seqlens are
-        # identical for every layer within the same step.  Build them once
-        # and reuse across layers.
-        layout_key = (batch_size, draft_token_num, mixed_qkv.device)
-        if self._verify_layout_key != layout_key:
-            self._verify_num_accepted_tokens = torch.full(
-                (batch_size,),
-                draft_token_num,
-                dtype=torch.int32,
-                device=mixed_qkv.device,
-            )
-            self._verify_dense_cu_seqlens = torch.arange(
-                0,
-                num_dense_tokens + 1,
-                step=draft_token_num,
-                dtype=torch.int32,
-                device=mixed_qkv.device,
-            )
-            self._verify_layout_key = layout_key
-        num_accepted_tokens = self._verify_num_accepted_tokens
-        dense_query_start_loc = self._verify_dense_cu_seqlens
+        num_accepted_tokens = torch.full(
+            (batch_size,),
+            draft_token_num,
+            dtype=torch.int32,
+            device=mixed_qkv.device,
+        )
+        dense_query_start_loc = torch.arange(
+            0,
+            num_dense_tokens + 1,
+            step=draft_token_num,
+            dtype=torch.int32,
+            device=mixed_qkv.device,
+        )
         processed_qkv = torch.ops.npu.causal_conv1d(
             dense_qkv.reshape(num_dense_tokens, -1).contiguous(),
             self._get_conv_weights_t(layer, mixed_qkv.dtype),
@@ -1051,7 +1036,13 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
 
         if replayssm_spec_fold:
-            dense_cu_seqlens = self._verify_dense_cu_seqlens
+            dense_cu_seqlens = torch.arange(
+                0,
+                (batch_size + 1) * draft_token_num,
+                draft_token_num,
+                device=q.device,
+                dtype=torch.int32,
+            )
             out = fused_sigmoid_gating_delta_rule_update(
                 A_log=layer.A_log,
                 a=dense_a,
