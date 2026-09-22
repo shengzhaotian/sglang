@@ -507,6 +507,49 @@ class AscendAttnBackend(AttentionBackend):
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
         )
+        if self.use_mla_fp8:
+            self._update_mla_fp8_kv_lengths(forward_batch, in_capture=in_capture)
+
+    def _update_mla_fp8_kv_lengths(self, forward_batch, *, in_capture=False):
+        # TileLang consumes a device tensor, not FIA's replay-updated host
+        # attribute. Keep its storage stable and refresh it outside the graph.
+        mode = forward_batch.forward_mode
+        if not (
+            mode.is_decode_or_idle()
+            or mode.is_target_verify()
+            or mode.is_draft_extend_v2()
+        ):
+            return
+        actual_mode = getattr(forward_batch, "actual_forward_mode", mode)
+        lengths = forward_batch.seq_lens
+        if not actual_mode.is_idle():
+            if mode.is_target_verify():
+                if not in_capture and _is_dflash_verify(forward_batch.spec_info):
+                    # DSpark publishes the final KV boundary on CPU; the
+                    # device prefix may lag behind under overlap scheduling.
+                    lengths = forward_batch.seq_lens_cpu
+                    if lengths is None:
+                        raise ValueError(
+                            "MLA C8 DSpark verify requires final CPU KV lengths"
+                        )
+                else:
+                    lengths = lengths + int(forward_batch.spec_info.draft_token_num)
+            elif mode.is_decode_or_idle() and forward_batch.spec_info is not None:
+                lengths = lengths + self.speculative_step_id + 1
+
+        metadata = self.forward_metadata
+        if metadata.actual_seq_lengths_kv is None:
+            metadata.actual_seq_lengths_kv = torch.empty_like(
+                forward_batch.seq_lens, dtype=torch.int64
+            )
+        kv_lengths = metadata.actual_seq_lengths_kv
+        if actual_mode.is_idle():
+            kv_lengths.zero_()
+        else:
+            kv_lengths.copy_(lengths)
+            num_padding = getattr(forward_batch, "num_padding", 0)
+            if num_padding:
+                kv_lengths[-num_padding:].zero_()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -578,7 +621,9 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
-        if forward_batch.forward_mode.is_target_verify():
+        if self.use_mla_fp8:
+            self._update_mla_fp8_kv_lengths(forward_batch)
+        elif forward_batch.forward_mode.is_target_verify():
             spec_algorithm = forward_batch.spec_algorithm
             if spec_algorithm is None or not spec_algorithm.is_dspark():
                 self.forward_metadata.seq_lens_cpu_int += spec_tokens_per_req
@@ -1022,9 +1067,8 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables[bs:, :].fill_(0)
 
         if self.use_mla_fp8:
-            # FIA v2 reads the stable page table above; NPUGraph.update replaces
-            # its host KV lengths on replay. It does not consume FlashMLA's
-            # BF16 metadata or the device-side speculative length adjustment.
+            # C8 uses the stable page table above. Its device KV lengths are
+            # refreshed by init_forward_metadata_out_graph; skip BF16 metadata.
             self.forward_metadata = metadata
             self.graph_mode = True
             return
@@ -3348,15 +3392,10 @@ class AscendAttnBackend(AttentionBackend):
             actual_seq_qlen = None
             input_layout = "BSND"
 
-        # DSpark's CPU metadata already includes the verify block. Do not add
-        # its width again; trim DP padding in Q, Q scale and block tables alike.
+        # Final KV boundaries are refreshed outside capture, including the
+        # DSpark verify block. Trim DP padding consistently with Q and pages.
         fm = self.forward_metadata
-        kv_lens = fm.seq_lens_cpu_int
-        if kv_lens is None:
-            kv_lens = fm.seq_lens_cpu_list
-        else:
-            kv_lens = kv_lens.tolist()
-        kv_lens = kv_lens[:batch_size]
+        kv_lens = fm.actual_seq_lengths_kv[:batch_size]
         block_table = fm.block_tables[:batch_size]
         num_query_heads = layer.tp_q_head_num
         live_output = output[:num_tokens]
@@ -3410,10 +3449,10 @@ class AscendAttnBackend(AttentionBackend):
                 .view(torch.float32)
                 .squeeze(-1)
             )
-            kv_lens = (kv_lens + [0] * (padded_bs - batch_size))[
-                req_start : req_start + local_bs
-            ]
             if padded_bs > batch_size:
+                kv_lens = torch.cat(
+                    (kv_lens, kv_lens.new_zeros(padded_bs - batch_size))
+                )
                 block_table = torch.cat(
                     (
                         block_table,
@@ -3426,6 +3465,7 @@ class AscendAttnBackend(AttentionBackend):
             # These are captured tensor operations, so replay reads the
             # refreshed full page table rather than a stale Python-side copy.
             block_table = block_table[req_start : req_start + local_bs]
+            kv_lens = kv_lens[req_start : req_start + local_bs]
             if is_verify:
                 actual_seq_qlen = list(range(width, t_local + 1, width))
             live_output = output.new_empty(t_local, num_query_heads, self.kv_lora_rank)
@@ -3450,14 +3490,18 @@ class AscendAttnBackend(AttentionBackend):
                 -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
             )
         from fia_decode_c8_tilelang_h24 import fia_decode_c8, workspace_numel
-        workspace = torch.empty(workspace_numel(batch_size, 4), dtype=torch.float32, device=q.device)
+        workspace = torch.empty(
+            workspace_numel(block_table.shape[0], 4),
+            dtype=torch.float32,
+            device=q.device,
+        )
         fia_decode_c8(
             q.contiguous(),
             c_kv.squeeze(1),
             q_rope.contiguous(),
             k_rope.squeeze(1),
             block_table,
-            self.forward_metadata.seq_lens.to(torch.int64),
+            kv_lens.contiguous(),
             q_scale.contiguous(),
             kv_scale,
             out = live_output,
