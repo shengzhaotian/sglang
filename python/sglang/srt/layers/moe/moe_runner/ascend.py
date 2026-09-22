@@ -250,6 +250,102 @@ class AscendRunnerCore(MoeRunnerCore):
         )
         return AscendRunnerOutput(hidden_states=hidden_states)
 
+    def w13_proj(
+        self,
+        runner_input: AscendRunnerInput,
+        quant_info: AscendQuantInfo,
+    ):
+        """Run only the w13 (gate & up) grouped matmul.
+
+        Returns ``(hidden_states, pertoken_scale, original_dtype)``.
+        ``pertoken_scale`` is ``None`` when activation is not fused.
+        """
+        x = runner_input.hidden_states
+        original_dtype = torch.float16 if x.dtype == torch.float16 else torch.bfloat16
+        expert_tokens = runner_input.expert_tokens
+        group_list_type = runner_input.group_list_type
+
+        w13_kernel = self.config.layer.w13_kernel
+
+        if getattr(self, 'use_fused_gmm1_situ', False):
+            # 融合 GMM1+SiTU+MXFP8 quant → 直接产出 (FP8, E8M0 scale) 给 GMM2
+            hidden_states, pertoken_scale = w13_kernel.apply_fused_gmm1_situ(
+                quant_info, x, expert_tokens,
+                pertoken_scale=runner_input.hidden_states_scale,
+                group_list_type=group_list_type,
+                beta=self.fused_beta,
+                linear_beta=self.fused_linear_beta,
+            )
+        elif isinstance(w13_kernel, NPUMXFP8MoEMethod):
+            hidden_states, pertoken_scale = w13_kernel.apply_fused_gmm1_swiglu(
+                quant_info,
+                x,
+                expert_tokens,
+                pertoken_scale=runner_input.hidden_states_scale,
+                group_list_type=group_list_type,
+            )
+        else:
+            hidden_states = w13_kernel.apply(
+                quant_info,
+                x,
+                expert_tokens,
+                pertoken_scale=runner_input.hidden_states_scale,
+                output_dtype=original_dtype,
+                weight_prefix="w13",
+                group_list_type=group_list_type,
+            )
+            pertoken_scale = None
+        return hidden_states, pertoken_scale, original_dtype
+
+    def apply_act(
+        self,
+        hidden_states: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        runner_input: AscendRunnerInput,
+    ):
+        """Apply the activation function between w13 and w2.
+
+        Returns ``(hidden_states, pertoken_scale)``.  When ``pertoken_scale``
+        is already set (MXFP8 fused path) this is a passthrough.
+        """
+        if pertoken_scale is not None:
+            return hidden_states, pertoken_scale
+
+        expert_tokens = runner_input.expert_tokens
+        group_list_type = runner_input.group_list_type
+
+        if isinstance(
+            self.activation,
+            (NPUSwigluDeepEPKernel, NPUSitu, NPUSituMXFP8Quant),
+        ):
+            return self.activation._apply_activation(
+                hidden_states,
+                group_list=expert_tokens,
+                group_list_type=group_list_type,
+            )
+        return self.activation._apply_activation(hidden_states)
+
+    def w2_proj(
+        self,
+        hidden_states: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        runner_input: AscendRunnerInput,
+        quant_info: AscendQuantInfo,
+        original_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Run only the w2 (down) grouped matmul."""
+        expert_tokens = runner_input.expert_tokens
+        group_list_type = runner_input.group_list_type
+        return self.config.layer.w2_kernel.apply(
+            quant_info,
+            hidden_states,
+            expert_tokens,
+            pertoken_scale=pertoken_scale,
+            output_dtype=original_dtype,
+            weight_prefix="w2",
+            group_list_type=group_list_type,
+        )
+
 
 # ---------------------------------------------------------------------------
 # QuantInfo

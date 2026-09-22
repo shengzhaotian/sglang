@@ -1203,6 +1203,189 @@ class KimiK3MoE(nn.Module):
             and not is_in_tc_piecewise_cuda_graph()
         )
 
+    def _forward_unfused_fine_grained(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        prefix_sum: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Fine-grained 5-phase dual-stream overlap for NPU DeepEP.
+
+        Each phase pairs one shared-expert op with one routed-expert op so
+        they execute concurrently on separate streams without core limiting:
+
+          Phase 1: shared allgather      || routed gate + select + down_proj
+          Phase 2: shared gate_up_proj   || routed dispatch  + w13_kernel + activation
+          Phase 3: shared act_fn         || routed w2_kernel
+          Phase 4: shared down_proj      || routed combine
+          Phase 5: shared reduce_scatter || routed norm + up_proj
+        """
+        from sglang.srt.layers.moe.moe_runner.ascend import (
+            AscendQuantInfo,
+            AscendRunnerOutput,
+        )
+        from sglang.srt.layers.moe.moe_runner.base import PermuteMethodPool
+
+        current_stream = torch.cuda.current_stream()
+        alt_stream = self.alt_stream
+
+        # Fork: alt stream inherits hidden_states ownership.
+        alt_stream.wait_stream(current_stream)
+        hidden_states.record_stream(alt_stream)
+
+        # ===== Phase 1: shared allgather (alt) || routed front (current) =====
+        with torch.cuda.stream(alt_stream):
+            shared_input = self._gather_shared_expert_inputs(hidden_states)
+            shared_input.record_stream(alt_stream)
+
+            # quant
+            original_dtype = shared_input.dtype
+            input_shape = shared_input.shape
+            x_2d = shared_input.reshape(-1, shared_input.shape[-1])
+            quant_bias = None
+
+            quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                x_2d, dst_type=torch.float8_e4m3fn
+            )
+
+        router_logits = self.gate(hidden_states)
+        topk_output = self._select_experts(hidden_states, router_logits)
+        routed_input, _ = self.routed_expert_down_proj(hidden_states)
+        alt_stream.wait_stream(current_stream)
+        # ===== Phase 2: shared gate_up_proj (alt) || routed dispatch + w13 + activation (current) =====
+        with torch.cuda.stream(alt_stream):
+            # gate_up, _ = self.shared_experts.gate_up_proj(shared_input)
+            # quant mm
+            gate_up = torch.ops.npu.npu_quant_matmul(
+                quantized_x,
+                self.shared_experts.gate_up_proj.weight,
+                self.shared_experts.gate_up_proj.weight_scale,
+                scale_dtype=torch.float8_e8m0fnu,
+                pertoken_scale=dynamic_scale,
+                pertoken_scale_dtype=torch.float8_e8m0fnu,
+                bias=quant_bias,
+                output_dtype=original_dtype,
+                x2_dtype=torch.float4_e2m1fn_x2,
+                group_sizes=[0, 0, 32],
+            )
+            output_shape = list(input_shape[:-1]) + [gate_up.shape[-1]]
+            gate_up = gate_up.reshape(output_shape)
+            shared_act = self.shared_experts.act_fn(gate_up)
+
+        dispatcher = self.experts.dispatcher
+        dispatcher.dispatch_a(
+            hidden_states=routed_input, topk_output=topk_output
+        )
+        dispatch_output = dispatcher.dispatch_b()
+
+        experts_layer = self.experts
+        quant_info = AscendQuantInfo(
+            w13_weight=experts_layer.w13_weight,
+            w2_weight=experts_layer.w2_weight,
+            w13_weight_scale=getattr(experts_layer, "w13_weight_scale", None),
+            w2_weight_scale=getattr(experts_layer, "w2_weight_scale", None),
+            w13_weight_offset=getattr(experts_layer, "w13_weight_offset", None),
+            w2_weight_offset=getattr(experts_layer, "w2_weight_offset", None),
+            w13_scale_bias=getattr(experts_layer, "w13_scale_bias", None),
+            w2_scale_bias=getattr(experts_layer, "w2_scale_bias", None),
+            w13_weight_bias=getattr(experts_layer, "w13_weight_bias", None),
+            w2_weight_bias=getattr(experts_layer, "w2_weight_bias", None),
+        )
+
+        runner = experts_layer.runner
+        runner_core = runner.runner_core
+        runner_config = runner.config
+        dispatch_format = dispatch_output.format.value
+        runner_format = runner_core.runner_backend.value
+        pre_permute_func = PermuteMethodPool.get_pre_permute(
+            dispatch_format, runner_format
+        )
+        running_state = {}
+        runner_input = pre_permute_func(
+            dispatch_output, quant_info, runner_config, running_state
+        )
+        if envs.SGLANG_NPU_MOE_GMM_SITU_QUANT_FUSED.get():
+            act_hidden, act_pertoken_scale, w13_original_dtype = (
+                runner_core.w13_proj(runner_input, quant_info)
+            )
+        else:
+            w13_hidden, w13_pertoken_scale, w13_original_dtype = (
+                runner_core.w13_proj(runner_input, quant_info)
+            )
+            act_hidden, act_pertoken_scale = runner_core.apply_act(
+                w13_hidden, w13_pertoken_scale, runner_input
+            )
+        alt_stream.wait_stream(current_stream)
+        # ===== Phase 3: shared act_fn (alt) || routed w2_kernel (current) =====
+        with torch.cuda.stream(alt_stream):
+            original_dtype = shared_act.dtype
+            input_shape = shared_act.shape
+            x_2d = shared_act.reshape(-1, shared_act.shape[-1])
+            quant_bias = None
+
+            quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                x_2d, dst_type=torch.float8_e4m3fn
+            )
+
+
+            # sshared_down, _ = self.shared_experts.down_proj(shared_act)
+
+        w2_hidden = runner_core.w2_proj(
+            act_hidden,
+            act_pertoken_scale,
+            runner_input,
+            quant_info,
+            w13_original_dtype,
+        )
+        runner_output = AscendRunnerOutput(hidden_states=w2_hidden)
+
+        post_permute_func = PermuteMethodPool.get_post_permute(
+            runner_format, dispatch_format
+        )
+        combine_input = post_permute_func(
+            runner_output, quant_info, runner_config, running_state
+        )
+        alt_stream.wait_stream(current_stream)
+        # ===== Phase 4: shared down_proj (alt) || routed combine (current) =====
+        with torch.cuda.stream(alt_stream):
+            # shared_down, _ = self.shared_experts.down_proj(shared_act)
+            shared_down = torch.ops.npu.npu_quant_matmul(
+                quantized_x,
+                self.shared_experts.down_proj.weight,
+                self.shared_experts.down_proj.weight_scale,
+                scale_dtype=torch.float8_e8m0fnu,
+                pertoken_scale=dynamic_scale,
+                pertoken_scale_dtype=torch.float8_e8m0fnu,
+                bias=quant_bias,
+                output_dtype=original_dtype,
+                x2_dtype=torch.float4_e2m1fn_x2,
+                group_sizes=[0, 0, 32],
+            )
+            output_shape = list(input_shape[:-1]) + [shared_down.shape[-1]]
+            shared_down = shared_down.reshape(output_shape)
+
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            dispatcher.combine_a(combine_input=combine_input)
+            expert_output = dispatcher.combine_b()
+        alt_stream.wait_stream(current_stream)
+        # ===== Phase 5: shared reduce_scatter (alt) || routed norm + up_proj (current) =====
+        with torch.cuda.stream(alt_stream):
+            shared_output = self._reduce_scatter_shared_experts(
+                shared_down, hidden_states
+            )
+            shared_event = alt_stream.record_event()
+
+        latent = self._reduce_latent(expert_output)
+        out, _ = self.routed_expert_up_proj(latent)
+
+        # Join: current stream waits for shared reduce_scatter to finish.
+        current_stream.wait_event(shared_event)
+        shared_output.record_stream(current_stream)
+
+        return _add3(out, shared_output, prefix_sum)
+
     def _forward_unfused(
         self,
         hidden_states: torch.Tensor,
@@ -1223,6 +1406,10 @@ class KimiK3MoE(nn.Module):
         # Shared and routed GEMMs wait for each other at phase boundaries;
         # each can run beside the other branch's communication.
         fine_grained_overlap = self._can_overlap_shared_experts_npu(hidden_states)
+        if fine_grained_overlap:
+            return self._forward_unfused_fine_grained(
+                hidden_states, prefix_sum=prefix_sum
+            )
         shared_input = None
         shared_output = None
         shared_event = None

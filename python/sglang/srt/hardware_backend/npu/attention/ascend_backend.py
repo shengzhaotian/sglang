@@ -507,7 +507,7 @@ class AscendAttnBackend(AttentionBackend):
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
         )
-        if self.use_mla_fp8:
+        if self.use_mla_fp8 and envs.SGLANG_NPU_SPARSE_ATTN_A2A.get():
             self._update_mla_fp8_kv_lengths(forward_batch, in_capture=in_capture)
 
     def _update_mla_fp8_kv_lengths(self, forward_batch, *, in_capture=False):
@@ -3395,13 +3395,13 @@ class AscendAttnBackend(AttentionBackend):
         # Final KV boundaries are refreshed outside capture, including the
         # DSpark verify block. Trim DP padding consistently with Q and pages.
         fm = self.forward_metadata
-        kv_lens = fm.actual_seq_lengths_kv[:batch_size]
         block_table = fm.block_tables[:batch_size]
         num_query_heads = layer.tp_q_head_num
         live_output = output[:num_tokens]
         parallel = get_parallel()
         tp_size = parallel.attn_tp_size
         if use_a2a:
+            kv_lens = fm.actual_seq_lengths_kv[:batch_size]
             tp_group = parallel.attn_tp_group
             t_padded, t_local, local_bs, padded_bs = self._a2a_fias_v2_sizes(
                 batch_size, tp_size, width
@@ -3504,7 +3504,7 @@ class AscendAttnBackend(AttentionBackend):
             q_rope.contiguous(),
             k_rope.squeeze(1),
             block_table,
-            kv_lens.contiguous(),
+            kv_lens.contiguous() if use_a2a else self.forward_metadata.seq_lens.to(torch.int64),
             q_scale.contiguous(),
             kv_scale,
             out = live_output,

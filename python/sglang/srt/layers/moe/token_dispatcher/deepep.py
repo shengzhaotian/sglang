@@ -703,25 +703,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        topk_ids = topk_ids.to(torch.int64) if os.getenv("DEEP_USE_MODE") != "ops" else topk_ids
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
-        if envs.SGLANG_NPU_8P_CASE.get():
-            core_num = 20
-        else:
-            core_num = 24
-        if envs.SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM.get():
-            cur_stream = torch.cuda.current_stream()
-            torch.npu.set_stream_limit(cur_stream, cube_num=core_num, vector_num=core_num * 2)
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
             topk_weights,
         )
-        if envs.SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM.get():
-            torch.npu.reset_stream_limit(cur_stream)
         return (
             hidden_states,
             topk_ids,
