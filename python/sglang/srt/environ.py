@@ -926,6 +926,9 @@ class Envs:
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
     # Set to 0 to allow AscendAttnBackend to set needs_cpu_seq_lens to False for dsa models.
     SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS = EnvBool(True)
+    # Fuse GMM1 + SiTU + MXFP8 quant into single kernel (Ascend A5).
+    # Requires SGLANG_NPU_MOE_SITU_MXFP8_FUSED and grouped_matmul_situ_quant op.
+    SGLANG_NPU_MOE_GMM_SITU_QUANT_FUSED = EnvBool(False)  # 默认关闭
 
     # ===================================================================
     # MUSA

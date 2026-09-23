@@ -221,6 +221,8 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             weight_scale.shape[2] // 2,
             2,
         ).transpose(1, 2)
+        if weight_prefix == "w13" and envs.SGLANG_NPU_MOE_GMM_SITU_QUANT_FUSED.get():
+            scale = scale.reshape(-1)
         weight_scale.data = scale
 
         # A5 DeepEP low-latency dispatch quantizes the valid received rows to
@@ -274,6 +276,51 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             x_dtype=torch.float8_e4m3fn,
             weight_dtype=fp4_dtype,
             per_token_scale_dtype=e8m0_dtype,
+        )
+
+    def apply_fused_gmm1_situ(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        group_list_type: int,
+        beta: float,
+        linear_beta: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fused GMM1 + SiTU + MXFP8 quant in a single kernel.
+
+        Replaces the two-step GMM1 (npu_grouped_matmul) + situ_mxfp8_quant
+        path. Returns (FP8 activations, E8M0 scales) ready for GMM2.
+        """
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(
+                hidden_states
+            )
+        else:
+            pertoken_scale = pertoken_scale.reshape(
+                hidden_states.shape[0], hidden_states.shape[1] // 64, 2
+            )
+
+        weight = quant_info.w13_weight
+        weight_scale = quant_info.w13_weight_scale
+
+        return torch.ops._C_ascend.grouped_matmul_situ_quant_weight_nz(
+            x=hidden_states,
+            weight=weight.view(torch.float4_e2m1fn_x2),
+            weight_scale=weight_scale.view(torch.float8_e8m0fnu),
+            weight_assist_matrix=None,
+            bias=None,
+            x_scale=pertoken_scale,
+            smooth_scale=None,
+            group_list=expert_tokens.to(torch.int64),
+            dequant_mode=1,
+            dequant_dtype=0,
+            quant_mode=1,
+            group_list_type=group_list_type,
+            tuning_config=None,
+            beta=beta,
+            linear_beta=linear_beta,
         )
 
 

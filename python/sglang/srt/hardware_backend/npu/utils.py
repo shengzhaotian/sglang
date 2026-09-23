@@ -180,7 +180,7 @@ def init_npu_backend():
         logger.warning("NPU custom kernel packages unavailable: %s", e)
 
     import torch_npu
-
+    torch.ops.load_library("/mnt/share/t00882532/k3/0922/op/vllm_ascend_C.cpython-312-aarch64-linux-gnu.so")
     # These imports lead to unpredictable behavior in diffusion models
     # and a significant reduction in performance.
     if "sglang.multimodal_gen" not in sys.modules:

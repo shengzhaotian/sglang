@@ -90,6 +90,7 @@ class AscendRunnerCore(MoeRunnerCore):
         super().__init__(config)
 
         kernel = config.layer.w2_kernel
+        self.use_fused_gmm1_situ = False
 
         if isinstance(kernel, NPUMXFP8MoEMethod):
             # MXFP8 fuses gate/up + swiglu + requant into gmm1, so there is no
@@ -106,8 +107,13 @@ class AscendRunnerCore(MoeRunnerCore):
             )
             if config.activation == "situ":
                 beta = config.gemm1_alpha if config.gemm1_alpha is not None else 4.0
-                if (
-                    isinstance(kernel, NPUW4A8MXFP4MoEMethod)
+                if (isinstance(kernel, NPUW4A8MXFP4MoEMethod)
+                    and envs.SGLANG_NPU_MOE_GMM_SITU_QUANT_FUSED.get()):
+                    self.use_fused_gmm1_situ = True
+                    self.activation = None  # 融合路径不需要独立 activation
+                    self.fused_beta = beta  # 已有的 beta 计算
+                    self.fused_linear_beta = config.gemm1_clamp_limit
+                elif (isinstance(kernel, NPUW4A8MXFP4MoEMethod)
                     and envs.SGLANG_NPU_MOE_SITU_MXFP8_FUSED.get()
                 ):
                     if config.gemm1_clamp_limit is None:
@@ -184,7 +190,16 @@ class AscendRunnerCore(MoeRunnerCore):
 
         w13_kernel = self.config.layer.w13_kernel
 
-        if isinstance(w13_kernel, NPUMXFP8MoEMethod):
+        if getattr(self, 'use_fused_gmm1_situ', False):
+            # 融合 GMM1+SiTU+MXFP8 quant → 直接产出 (FP8, E8M0 scale) 给 GMM2
+            hidden_states, pertoken_scale = w13_kernel.apply_fused_gmm1_situ(
+                quant_info, x, expert_tokens,
+                pertoken_scale=runner_input.hidden_states_scale,
+                group_list_type=group_list_type,
+                beta=self.fused_beta,
+                linear_beta=self.fused_linear_beta,
+            )
+        elif isinstance(w13_kernel, NPUMXFP8MoEMethod):
             # --- w13 projection + activation, fused into one kernel ---
             # MXFP8 gmm1 returns activations already requantised for gmm2, so
             # there is no separate activation step to run.
