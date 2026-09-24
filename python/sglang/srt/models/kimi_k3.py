@@ -143,6 +143,8 @@ from sglang.srt.utils.common import (
     set_weight_attrs,
 )
 
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -3041,7 +3043,12 @@ class KimiK3DecoderLayer(nn.Module):
             hidden_states, allow_scatter=False
         )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+
+        if not (
+            envs.SGLANG_NPU_MOCK_PREFILL_MLP.get()
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.IDLE)
+        ):
+            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return hidden_states, residual, False, topk_indices
 
     def _forward_attn_residual(
@@ -3178,9 +3185,15 @@ class KimiK3DecoderLayer(nn.Module):
 
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
-        out = self.mlp(
-            hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
-        )
+        if not (
+            envs.SGLANG_NPU_MOCK_PREFILL_MLP.get()
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.IDLE)
+        ):
+            out = self.mlp(
+                hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
+            )
+        else:
+            out = hidden_states
         if shard_lo >= 0:
             if keep_sharded:
                 return out, None, True, topk_indices
